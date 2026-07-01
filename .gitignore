@@ -1,0 +1,27 @@
+# Environment and secrets
+.env
+.env.local
+*.pem
+
+# Nessus outputs
+*.log
+*.nessus
+*.pdf
+
+# Plugin update artifacts (created inside container)
+all-2.0.tar.gz
+
+# Local packages directory (user-provided .deb and plugin archives)
+packages/*
+!packages/.gitkeep
+
+# OS and editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+__pycache__/
+*.py[cod]
+.cursor/
+.vscode/
+*.bak

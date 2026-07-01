@@ -1,0 +1,14 @@
+.git
+.env
+.env.*
+*.pem
+*.log
+*.nessus
+*.pdf
+__pycache__/
+*.py[cod]
+all-2.0.tar.gz
+packages/*
+!packages/.gitkeep
+.cursor/
+.vscode/

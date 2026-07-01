@@ -1,0 +1,65 @@
+services:
+  nessus:
+    build: .
+    container_name: nessus
+    restart: always
+    stop_grace_period: 30s
+    env_file:
+      - path: .env
+        required: false
+    expose:
+      - "8834"
+      - "8080"
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - LINUX_IMMUTABLE
+    volumes:
+      - nessus_data:/opt/nessus
+      - ./packages:/mnt/nessus:ro
+    networks:
+      - nessus_internal
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck.sh"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: ${NESSUS_HEALTH_START_PERIOD:-1800}s
+
+  gateway:
+    build: ./gateway
+    container_name: nessus-gateway
+    restart: always
+    depends_on:
+      nessus:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "8834:8834"
+    networks:
+      - nessus_internal
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "--no-check-certificate", "https://localhost:8834/manage/v1/health"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: ${NESSUS_HEALTH_START_PERIOD:-1800}s
+
+networks:
+  nessus_internal:
+    driver: bridge
+
+volumes:
+  nessus_data:
