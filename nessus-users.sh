@@ -40,24 +40,24 @@ nessus_create_user() {
     while [ $waited -lt $max_wait ]; do
         attempt=$((attempt + 1))
         result=$(expect <<'EXPECT_SCRIPT' 2>&1
-set timeout 90
+set timeout 120
 log_user 0
-spawn /opt/nessus/sbin/nessuscli adduser $env(EXPECT_USERNAME)
+spawn /opt/nessus/sbin/nessuscli adduser
 
 expect {
     -re -nocase {login:\s*$} {
         send "$env(EXPECT_USERNAME)\r"
         exp_continue
     }
-    -re -nocase {login password:\s*$} {
-        send "$env(EXPECT_PASSWORD)\r"
-        exp_continue
-    }
     -re -nocase {login password \(again\)} {
         send "$env(EXPECT_PASSWORD)\r"
         exp_continue
     }
-    -re -nocase {system administrator.*\(y/n\)} {
+    -re -nocase {login password:\s*$} {
+        send "$env(EXPECT_PASSWORD)\r"
+        exp_continue
+    }
+    -re -nocase {administrator.*\(y/n\)} {
         if { $env(EXPECT_IS_ADMIN) eq "y" } {
             send "y\r"
         } else {
@@ -65,7 +65,7 @@ expect {
         }
         exp_continue
     }
-    -re -nocase {enter the rules} {
+    -re -nocase {rules set|enter the rules|User rules} {
         send "default accept\r"
         send "\r"
         exp_continue
@@ -110,7 +110,7 @@ EXPECT_SCRIPT
             sleep "$delay"
         else
             $log_fn "Error: Failed to create user '$username'"
-            echo "$result" | tail -8 | while read -r line; do
+            echo "$result" | tail -20 | while read -r line; do
                 [ -n "$line" ] && $log_fn "  $line"
             done
             unset EXPECT_PASSWORD
@@ -196,6 +196,8 @@ ensure_admin_user() {
     local log_fn="${1:-echo}"
     local user="${NESSUS_USERNAME:-admin}"
     local pass="${NESSUS_PASSWORD:-admin}"
+
+    sleep 3
 
     if ! nessus_user_exists "$user"; then
         if ! nessus_create_user "$user" "$pass" "y" "$log_fn"; then
