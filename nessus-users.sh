@@ -40,24 +40,21 @@ nessus_create_user() {
     while [ $waited -lt $max_wait ]; do
         attempt=$((attempt + 1))
         result=$(expect <<'EXPECT_SCRIPT' 2>&1
-set timeout 120
+set timeout 60
 log_user 0
-spawn /opt/nessus/sbin/nessuscli adduser
+spawn /opt/nessus/sbin/nessuscli adduser $env(EXPECT_USERNAME)
 
 expect {
-    -re -nocase {login:\s*$} {
-        send "$env(EXPECT_USERNAME)\r"
-        exp_continue
-    }
-    -re -nocase {login password \(again\)} {
+    "Login password:" {
         send "$env(EXPECT_PASSWORD)\r"
         exp_continue
     }
-    -re -nocase {login password:\s*$} {
+    "Login password (again):" {
         send "$env(EXPECT_PASSWORD)\r"
         exp_continue
     }
-    -re -nocase {administrator.*\(y/n\)} {
+    "system administrator" {
+        expect -re {\(y/n\).*:}
         if { $env(EXPECT_IS_ADMIN) eq "y" } {
             send "y\r"
         } else {
@@ -65,24 +62,28 @@ expect {
         }
         exp_continue
     }
-    -re -nocase {rules set|enter the rules|User rules} {
-        send "default accept\r"
+    "Enter the rules for this user" {
         send "\r"
         exp_continue
     }
-    -re -nocase {is that ok.*\(y/n\)} {
+    "Is that ok?" {
+        expect -re {\(y/n\).*:}
         send "y\r"
         exp_continue
     }
-    -re -nocase {user added} {
+    "User added" {
         puts "OK"
         exit 0
     }
-    -re -nocase {already exists} {
+    "already exists" {
         puts "OK"
         exit 0
     }
-    -re -nocase {global.db is not ready} {
+    "global.db is not ready yet" {
+        puts "RETRY"
+        exit 2
+    }
+    "global.db is not ready" {
         puts "RETRY"
         exit 2
     }
@@ -196,8 +197,6 @@ ensure_admin_user() {
     local log_fn="${1:-echo}"
     local user="${NESSUS_USERNAME:-admin}"
     local pass="${NESSUS_PASSWORD:-admin}"
-
-    sleep 3
 
     if ! nessus_user_exists "$user"; then
         if ! nessus_create_user "$user" "$pass" "y" "$log_fn"; then
