@@ -406,6 +406,96 @@ start_operator_api() {
     log "Operator API process started (pid ${MANAGE_API_PID})"
 }
 
+bootstrap_plugins_async() {
+    (
+        local UPDATE_FLAG="/opt/nessus/var/nessus/.update_completed"
+        local status plugin_set plugin_data
+
+        if has_update_source; then
+            if [ ! -f "$UPDATE_FLAG" ] || /usr/local/bin/update.sh --feed-changed; then
+                log "[bootstrap] Starting plugin update in background..."
+                if /usr/local/bin/update.sh; then
+                    log "[bootstrap] Plugin update completed"
+                else
+                    log "[bootstrap] Warning: Plugin update failed"
+                fi
+            elif [ -f "$UPDATE_FLAG" ]; then
+                log "[bootstrap] Applying cached patch..."
+                stop_nessus
+                /usr/local/bin/patch.sh 2>&1 || true
+                start_nessus
+            fi
+        elif [ -f "$UPDATE_FLAG" ]; then
+            log "[bootstrap] Applying cached patch..."
+            stop_nessus
+            /usr/local/bin/patch.sh 2>&1 || true
+            start_nessus
+        else
+            log "[bootstrap] No plugin source configured; skipping feed bootstrap"
+            return 0
+        fi
+
+        log "[bootstrap] Waiting for plugin compilation (timeout ${NESSUS_READY_TIMEOUT:-1800}s)..."
+        if ! wait_for_ready "${NESSUS_READY_TIMEOUT:-1800}"; then
+            log "[bootstrap] Warning: Plugin compilation did not finish within timeout"
+            return 1
+        fi
+
+        status=$(get_status)
+        plugin_data=$(status_plugin_data "$status")
+        if [ "$plugin_data" != "true" ] && [ -f "$UPDATE_FLAG" ]; then
+            log "[bootstrap] Plugins not loaded; retrying patch..."
+            stop_nessus
+            /usr/local/bin/patch.sh 2>&1 || true
+            start_nessus
+            wait_for_ready "${NESSUS_READY_RETRY_TIMEOUT:-600}" || true
+        fi
+
+        status=$(get_status)
+        plugin_set=$(status_plugin_set "$status")
+        plugin_data=$(status_plugin_data "$status")
+        if [ "$plugin_data" = "true" ]; then
+            log "[bootstrap] Plugins ready${plugin_set:+ ($plugin_set)}"
+        else
+            log "[bootstrap] Warning: Plugins still not loaded after bootstrap"
+        fi
+    ) &
+    log "Plugin bootstrap running in background (pid $!)"
+}
+
+print_startup_banner() {
+    local display_url status plugin_set plugin_data engine_state engine_progress
+
+    display_url=$(get_display_url)
+    status=$(get_status)
+    plugin_set=$(status_plugin_set "$status")
+    plugin_data=$(status_plugin_data "$status")
+    engine_state=$(echo "$status" | grep -o '"engine_status":{[^}]*}' | grep -o '"status":"[^"]*"' | cut -d'"' -f4)
+    engine_progress=$(echo "$status" | grep -o '"engine_status":{[^}]*}' | grep -o '"progress":[0-9]*' | cut -d: -f2)
+
+    echo ""
+    echo "========================================="
+    echo "            NESSUS IS UP"
+    echo "========================================="
+    echo "  URL:      $display_url"
+    echo "  User:     ${NESSUS_USERNAME:-admin}"
+    if [ "$plugin_data" = "true" ]; then
+        if [ -n "$plugin_set" ]; then
+            echo "  Plugins:  Loaded ($plugin_set)"
+        else
+            echo "  Plugins:  Loaded"
+        fi
+    elif [ "$engine_state" = "ready" ]; then
+        echo "  Plugins:  Not loaded (bootstrap in background)"
+    elif [ -n "$engine_progress" ]; then
+        echo "  Plugins:  Compiling (${engine_progress}%, background)"
+    else
+        echo "  Plugins:  Bootstrap in background (check /manage/v1/health)"
+    fi
+    echo "========================================="
+    echo ""
+}
+
 echo ""
 echo "=== Starting Nessus Container ==="
 echo ""
@@ -457,76 +547,8 @@ if ! pgrep -f "nessus-service" > /dev/null 2>&1; then
     wait_for_nessus || exit 1
 fi
 
-UPDATE_FLAG="/opt/nessus/var/nessus/.update_completed"
-
-if has_update_source; then
-    if [ ! -f "$UPDATE_FLAG" ] || /usr/local/bin/update.sh --feed-changed; then
-        if /usr/local/bin/update.sh; then
-            log "Plugin bootstrap/update completed"
-        else
-            log "Warning: Plugin update failed"
-        fi
-    elif [ -f "$UPDATE_FLAG" ]; then
-        log "Plugins: cached (feed unchanged)"
-        stop_nessus
-        /usr/local/bin/patch.sh 2>&1 || true
-    fi
-elif [ -f "$UPDATE_FLAG" ]; then
-    log "Plugins: cached"
-    stop_nessus
-    /usr/local/bin/patch.sh 2>&1 || true
-fi
-
-if ! pgrep -f "nessus-service" > /dev/null; then
-    start_nessus
-    wait_for_nessus || exit 1
-fi
-
-log "Waiting for Nessus to be fully ready (timeout ${NESSUS_READY_TIMEOUT:-1800}s)..."
-wait_for_ready "${NESSUS_READY_TIMEOUT:-1800}"
-
-parse_status() {
-    local s="$1"
-    plugin_set=$(status_plugin_set "$s")
-    plugin_data=$(status_plugin_data "$s")
-}
-
-status=$(get_status)
-parse_status "$status"
-
-if [ "$plugin_data" != "true" ] && [ -f "$UPDATE_FLAG" ]; then
-    log "Plugins not loaded, restarting with patch..."
-    stop_nessus
-    /usr/local/bin/patch.sh 2>&1 || true
-    start_nessus
-    wait_for_nessus || exit 1
-    wait_for_ready "${NESSUS_READY_RETRY_TIMEOUT:-600}"
-    status=$(get_status)
-    parse_status "$status"
-fi
-
-display_url=$(get_display_url)
-
-echo ""
-echo "========================================="
-echo "           NESSUS IS READY"
-echo "========================================="
-echo "  URL:      $display_url"
-echo "  User:     ${NESSUS_USERNAME:-admin}"
-if [ "$plugin_data" = "true" ]; then
-    if [ -n "$plugin_set" ]; then
-        echo "  Plugins:  Loaded ($plugin_set)"
-    else
-        echo "  Plugins:  Loaded"
-    fi
-else
-    echo "  Plugins:  Not loaded"
-fi
-echo "========================================="
-echo ""
-
-# Operator API already started earlier; ensure it is still running before the watchdog loop.
-start_operator_api
+print_startup_banner
+bootstrap_plugins_async
 
 while true; do
     if [ "${NESSUS_MANAGE_API:-1}" = "1" ]; then

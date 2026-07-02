@@ -35,7 +35,7 @@ ALLOWED_ARCHIVE_ROOTS = (
     Path("/tmp"),
 )
 HOLD_FILE = Path(os.environ.get(
-    "NESSUS_UPDATE_HOLD_FILE", "/mnt/nessus/.update_hold"
+    "NESSUS_UPDATE_HOLD_FILE", "/opt/nessus/var/nessus/.update_hold"
 ))
 LOCK_FILE = Path("/tmp/nessus_update.lock")
 API_PREFIX = "/manage/v1"
@@ -884,14 +884,30 @@ class OperatorHandler(BaseHTTPRequestHandler):
             reason = str(body.get("reason", "orchestrator hold")).strip()
             if len(reason) > 200:
                 reason = reason[:200]
-            HOLD_FILE.parent.mkdir(parents=True, exist_ok=True)
-            HOLD_FILE.write_text(reason + "\n", encoding="utf-8")
+            try:
+                HOLD_FILE.parent.mkdir(parents=True, exist_ok=True)
+                HOLD_FILE.write_text(reason + "\n", encoding="utf-8")
+            except OSError as exc:
+                self._json_response(500, {
+                    "error": "Cannot write hold file",
+                    "path": str(HOLD_FILE),
+                    "message": str(exc),
+                })
+                return
             self._json_response(200, {"status": "ok", "hold_active": True, "reason": reason})
             return
 
         if path == f"{API_PREFIX}/hold" and method == "DELETE":
-            if HOLD_FILE.is_file():
-                HOLD_FILE.unlink()
+            try:
+                if HOLD_FILE.is_file():
+                    HOLD_FILE.unlink()
+            except OSError as exc:
+                self._json_response(500, {
+                    "error": "Cannot remove hold file",
+                    "path": str(HOLD_FILE),
+                    "message": str(exc),
+                })
+                return
             self._json_response(200, {"status": "ok", "hold_active": False})
             return
 

@@ -34,7 +34,7 @@ docker compose up -d --force-recreate gateway
 
 Then open `https://localhost:8834` again and add a certificate exception.
 
-First startup takes 5–15 minutes (`.deb` install, plugin compilation).
+First startup: UI and Operator API are available within a few minutes; plugin compilation continues in the background (15–20 min for a full feed). Check `GET /manage/v1/health` — `"ready": true` when scans can run.
 
 ## Management: three ways
 
@@ -93,6 +93,8 @@ X-ApiKeys: accessKey=...; secretKey=...
 Update states: `idle` → `running` → `completed` | `deferred` | `failed` | `cancelled`.
 
 Update checks hold and active scans first, **then** downloads the archive (if online).
+
+Hold state is stored in `NESSUS_UPDATE_HOLD_FILE` (default: `/opt/nessus/var/nessus/.update_hold` on the writable data volume — not under `/mnt/nessus`, which is read-only).
 When `packages/all-2.0.tar.gz` changes, bootstrap on container start runs update again (fingerprint in `.update_feed_stamp`).
 
 ## Typical workflows
@@ -342,17 +344,20 @@ Scan-gate (wait for active scans) applies to every `update.sh` run except `--for
 
 ### Startup timeouts and healthcheck
 
+Startup is **non-blocking**: Nessus UI, gateway, and Operator API come up as soon as the engine responds; plugin install/compile runs in a **background bootstrap** (`[bootstrap]` in logs).
+
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `NESSUS_READY_TIMEOUT` | `1800` (30 min) | Wait for plugin compilation in entrypoint/update |
-| `NESSUS_READY_RETRY_TIMEOUT` | `600` (10 min) | Retry wait after patch/restart |
-| `NESSUS_HEALTH_START_PERIOD` | `1800` | Healthcheck grace period in `docker-compose` |
+| `NESSUS_READY_TIMEOUT` | `1800` (30 min) | Background bootstrap: wait for plugin compilation |
+| `NESSUS_READY_RETRY_TIMEOUT` | `600` (10 min) | Retry wait after patch/restart in bootstrap |
+| `NESSUS_HEALTH_START_PERIOD` | `120` | Healthcheck grace period in `docker-compose` |
+| `NESSUS_HEALTH_STRICT` | `0` | `1` = Docker health requires `pluginData=true` (old blocking behaviour) |
 
-On first start with a large feed (`all-2.0.tar.gz` ~750MB), compilation can take 15–20 minutes.
-If the container goes `unhealthy`, increase all three values (e.g. `3600`).
+On first start with a large feed (`all-2.0.tar.gz` ~750MB), compilation can take 15–20 minutes — the container is **healthy** before that finishes.
 
-The `nessus` healthcheck verifies: `engine_status=ready` + `pluginData=true` + `GET /manage/v1/health` (operator).
-The gateway starts only after `nessus: healthy`.
+The `nessus` healthcheck verifies: Nessus `/server/status` responds + `GET /manage/v1/health` (operator). Scan readiness is in the API: `"ready": true` only when `engine_status=ready` and `pluginData=true`.
+
+The gateway starts after `nessus: healthy` (typically within a few minutes, not after compile).
 
 ## Local packages (offline)
 
@@ -403,7 +408,7 @@ docker compose down -v
 | `patch.sh` | Feed patch, immutable lock |
 | `nessus-api.sh` | REST helpers, scan checks |
 | `nessus-users.sh` | Admin creation, creds for scan-gate |
-| `healthcheck.sh` | Docker health: Nessus ready + operator API |
+| `healthcheck.sh` | Docker health: Nessus alive + operator API |
 | `env.example` | `.env` template |
 
 ## License
