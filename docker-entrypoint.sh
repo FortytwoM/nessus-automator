@@ -212,26 +212,30 @@ CERTEOF
 }
 
 resolve_local_deb() {
-    if [ -n "${NESSUS_DEB_PATH:-}" ]; then
-        if [ -f "$NESSUS_DEB_PATH" ]; then
-            printf '%s' "$NESSUS_DEB_PATH"
-            return 0
-        fi
-        log "Error: NESSUS_DEB_PATH not found: $NESSUS_DEB_PATH"
-        return 1
-    fi
-
     local mount_dir="/mnt/nessus"
+    local deb_files=() seen="" f candidate=""
+
+    if [ -n "${NESSUS_DEB_PATH:-}" ] && [ -f "$NESSUS_DEB_PATH" ]; then
+        printf '%s' "$NESSUS_DEB_PATH"
+        return 0
+    fi
+    if [ -n "${NESSUS_DEB_PATH:-}" ]; then
+        log "Warning: NESSUS_DEB_PATH not found: $NESSUS_DEB_PATH (scanning $mount_dir/)"
+    fi
+
     if [ ! -d "$mount_dir" ]; then
+        log "Error: $mount_dir is not mounted (check docker-compose volumes)"
         return 1
     fi
 
-    local deb_files=()
-    local f
-    for f in "$mount_dir"/Nessus-*.deb "$mount_dir"/*.deb; do
-        [ -f "$f" ] || continue
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        case " $seen " in
+            *" $f "*) continue ;;
+        esac
+        seen="$seen $f"
         deb_files+=("$f")
-    done
+    done < <(find "$mount_dir" -maxdepth 1 -type f -name '*.deb' 2>/dev/null | sort)
 
     if [ "${#deb_files[@]}" -eq 1 ]; then
         printf '%s' "${deb_files[0]}"
@@ -245,6 +249,12 @@ resolve_local_deb() {
         return 1
     fi
 
+    log "Error: No .deb in $mount_dir (host ./packages/ next to docker-compose.yml)"
+    log "  Contents:"
+    for candidate in "$mount_dir"/*; do
+        [ -e "$candidate" ] || continue
+        log "    $(basename "$candidate")"
+    done
     return 1
 }
 
