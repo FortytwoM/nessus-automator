@@ -8,6 +8,7 @@ nessus_apply_profile() {
     case "${NESSUS_PROFILE:-}" in
         offline)
             NESSUS_UPDATE_URL=""
+            NESSUS_DEB_INSTALL="${NESSUS_DEB_INSTALL:-local}"
             ;;
         online)
             ;;
@@ -34,6 +35,7 @@ export NESSUS_HEALTH_START_PERIOD="${NESSUS_HEALTH_START_PERIOD:-1800}"
 # --- Install (.deb) ---
 export NESSUS_DEB_URL="${NESSUS_DEB_URL:-}"
 export NESSUS_DEB_PATH="${NESSUS_DEB_PATH:-}"
+export NESSUS_DEB_INSTALL="${NESSUS_DEB_INSTALL:-}"
 
 # --- Plugins ---
 export NESSUS_UPDATE_URL="${NESSUS_UPDATE_URL:-}"

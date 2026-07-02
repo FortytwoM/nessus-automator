@@ -277,8 +277,23 @@ NESSUS_UPDATE_URL=https://plugins.nessus.org/v2/nessus.php?f=all-2.0.tar.gz&u=..
 **Offline** — files in `packages/`:
 
 ```env
+NESSUS_PROFILE=offline
 NESSUS_PLUGIN_SET=202606300622   # required; from offline.php, same release as the archive
-# packages/all-2.0.tar.gz, packages/*.deb
+# packages/Nessus-10.12.0-debian10_amd64.deb   (first install only)
+# packages/all-2.0.tar.gz
+```
+
+**First install (local .deb)** — if Tenable API returns 403 or there is no internet:
+
+1. Download `Nessus-*-debian10_amd64.deb` from [Tenable downloads](https://www.tenable.com/downloads/nessus) (login required).
+2. Copy to `packages/` (one `.deb` file).
+3. Start the container — no `NESSUS_DEB_PATH` needed if there is only one `.deb`.
+
+Or set explicitly:
+
+```env
+NESSUS_DEB_PATH=/mnt/nessus/Nessus-10.12.0-debian10_amd64.deb
+# NESSUS_DEB_INSTALL=local   # skip Tenable API even without NESSUS_PROFILE=offline
 ```
 
 **Online** — `plugin_set` is fetched from [plugins.php](https://plugins.nessus.org/v2/plugins.php) during patch; do not pass it manually.
@@ -345,7 +360,7 @@ The `packages/` directory is mounted at `/mnt/nessus` (read-only):
 
 | File | Purpose |
 |------|---------|
-| `*.deb` | Nessus installer |
+| `Nessus-*-debian10_amd64.deb` | Nessus installer (**first start**, if API/install URL unavailable) |
 | `all-2.0.tar.gz` | Plugin feed |
 
 ```bash

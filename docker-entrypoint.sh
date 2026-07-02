@@ -212,29 +212,57 @@ CERTEOF
 }
 
 resolve_local_deb() {
-    if [ -n "${NESSUS_DEB_PATH:-}" ] && [ -f "$NESSUS_DEB_PATH" ]; then
-        printf '%s' "$NESSUS_DEB_PATH"
-        return 0
+    if [ -n "${NESSUS_DEB_PATH:-}" ]; then
+        if [ -f "$NESSUS_DEB_PATH" ]; then
+            printf '%s' "$NESSUS_DEB_PATH"
+            return 0
+        fi
+        log "Error: NESSUS_DEB_PATH not found: $NESSUS_DEB_PATH"
+        return 1
     fi
 
     local mount_dir="/mnt/nessus"
-    if [ -d "$mount_dir" ]; then
-        local deb_files=()
-        local f
-        for f in "$mount_dir"/*.deb; do
-            [ -f "$f" ] || continue
-            deb_files+=("$f")
+    if [ ! -d "$mount_dir" ]; then
+        return 1
+    fi
+
+    local deb_files=()
+    local f
+    for f in "$mount_dir"/Nessus-*.deb "$mount_dir"/*.deb; do
+        [ -f "$f" ] || continue
+        deb_files+=("$f")
+    done
+
+    if [ "${#deb_files[@]}" -eq 1 ]; then
+        printf '%s' "${deb_files[0]}"
+        return 0
+    fi
+    if [ "${#deb_files[@]}" -gt 1 ]; then
+        log "Error: Multiple .deb files in $mount_dir; set NESSUS_DEB_PATH to choose one:"
+        for f in "${deb_files[@]}"; do
+            log "  - $f"
         done
-        if [ "${#deb_files[@]}" -eq 1 ]; then
-            printf '%s' "${deb_files[0]}"
-            return 0
-        fi
-        if [ "${#deb_files[@]}" -gt 1 ]; then
-            log "Warning: Multiple .deb files in $mount_dir; set NESSUS_DEB_PATH to choose one"
-        fi
+        return 1
     fi
 
     return 1
+}
+
+nessus_remote_install_allowed() {
+    case "${NESSUS_DEB_INSTALL:-}" in
+        local|offline) return 1 ;;
+    esac
+    [ "${NESSUS_PROFILE:-}" = "offline" ] && return 1
+    return 0
+}
+
+log_local_deb_hint() {
+    log "Hint: First install needs a local Nessus .deb package:"
+    log "  1. Download Nessus-*-debian10_amd64.deb from your Tenable account"
+    log "  2. Put it in ./packages/  (container path: /mnt/nessus/)"
+    log "  3. Or set NESSUS_DEB_PATH=/mnt/nessus/Nessus-....deb"
+    log "  4. Or set NESSUS_DEB_URL=<direct .deb download URL>"
+    log "  Offline profile (NESSUS_PROFILE=offline) never uses the Tenable API."
 }
 
 install_nessus() {
@@ -255,8 +283,13 @@ install_nessus() {
         log "Downloading Nessus from $NESSUS_DEB_URL"
         wget -q --no-check-certificate -O "$deb_file" "$NESSUS_DEB_URL" || {
             log "Error: Download failed"
+            log_local_deb_hint
             return 1
         }
+    elif ! nessus_remote_install_allowed; then
+        log "Error: Local Nessus .deb required (remote install disabled)"
+        log_local_deb_hint
+        return 1
     else
         log "Fetching latest Nessus download URL..."
 
@@ -266,6 +299,7 @@ install_nessus() {
 
         if [ "$http_code" != "200" ] || [ -z "$body" ]; then
             log "Error: Tenable API HTTP $http_code"
+            log_local_deb_hint
             return 1
         fi
 
@@ -280,6 +314,7 @@ install_nessus() {
 
         if [ -z "$download_url" ] || [ "$download_url" = "null" ]; then
             log "Error: Could not parse Nessus download URL from API response"
+            log_local_deb_hint
             return 1
         fi
 
@@ -288,6 +323,7 @@ install_nessus() {
         log "Downloading Nessus from $download_url"
         wget -q --no-check-certificate -O "$deb_file" "$download_url" || {
             log "Error: Download failed"
+            log_local_deb_hint
             return 1
         }
     fi
