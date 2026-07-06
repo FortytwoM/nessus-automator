@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import mmap
 import os
@@ -640,28 +639,6 @@ nessus_active_scans_report
     return scans
 
 
-_basic_auth_cache: dict[tuple[str, str], tuple[str, float]] = {}
-_BASIC_AUTH_CACHE_TTL = 300
-
-
-class NessusUnreachable(Exception):
-    """Nessus REST API is not reachable (engine stopped during update, etc.)."""
-
-
-def credentials_match_env(username: str, password: str) -> bool:
-    env_user = os.environ.get("NESSUS_USERNAME", "admin")
-    env_pass = os.environ.get("NESSUS_PASSWORD", "admin")
-    return username == env_user and password == env_pass
-
-
-def synthetic_admin_session(username: str) -> dict[str, Any]:
-    return {
-        "permissions": ADMIN_PERMISSION,
-        "type": "administrator",
-        "name": username,
-    }
-
-
 def fetch_nessus_session(req_headers: dict[str, str]) -> dict[str, Any] | None:
     req = urllib.request.Request(
         f"{NESSUS_API_BASE}/session",
@@ -674,105 +651,16 @@ def fetch_nessus_session(req_headers: dict[str, str]) -> dict[str, Any] | None:
             if not isinstance(data, dict) or data.get("error"):
                 return None
             return data
-    except urllib.error.HTTPError:
-        return None
-    except urllib.error.URLError as exc:
-        raise NessusUnreachable(str(exc.reason)) from exc
-    except (json.JSONDecodeError, OSError) as exc:
-        raise NessusUnreachable(str(exc)) from exc
-
-
-def nessus_login_token(username: str, password: str) -> str | None:
-    payload = json.dumps({"username": username, "password": password}).encode("utf-8")
-    req = urllib.request.Request(
-        f"{NESSUS_API_BASE}/session",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, context=_ssl_ctx, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            if not isinstance(data, dict) or data.get("error"):
-                return None
-            token = data.get("token")
-            return str(token).strip() if token else None
-    except urllib.error.HTTPError as exc:
-        if exc.code in {401, 403}:
-            return None
-        raise NessusUnreachable(f"Nessus session HTTP {exc.code}") from exc
-    except urllib.error.URLError as exc:
-        raise NessusUnreachable(str(exc.reason)) from exc
-    except (json.JSONDecodeError, OSError) as exc:
-        raise NessusUnreachable(str(exc)) from exc
-
-
-def parse_basic_auth_header(value: str) -> tuple[str, str] | None:
-    raw = value.strip()
-    if not raw.lower().startswith("basic "):
-        return None
-    try:
-        decoded = base64.b64decode(raw[6:].strip(), validate=True).decode("utf-8")
-    except (ValueError, UnicodeDecodeError):
-        return None
-    if ":" not in decoded:
-        return None
-    username, password = decoded.split(":", 1)
-    if not username:
-        return None
-    return username, password
-
-
-def nessus_session_from_basic(username: str, password: str) -> dict[str, Any] | None:
-    cache_key = (username, password)
-    now = time.time()
-    cached = _basic_auth_cache.get(cache_key)
-    if cached and now - cached[1] < _BASIC_AUTH_CACHE_TTL:
-        try:
-            session = fetch_nessus_session({"X-Cookie": f"token={cached[0]}"})
-            if session:
-                return session
-        except NessusUnreachable:
-            if credentials_match_env(username, password):
-                return synthetic_admin_session(username)
-
-    try:
-        token = nessus_login_token(username, password)
-    except NessusUnreachable:
-        if credentials_match_env(username, password):
-            return synthetic_admin_session(username)
-        return None
-
-    if not token:
-        return None
-    _basic_auth_cache[cache_key] = (token, now)
-    try:
-        return fetch_nessus_session({"X-Cookie": f"token={token}"})
-    except NessusUnreachable:
-        if credentials_match_env(username, password):
-            return synthetic_admin_session(username)
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, OSError):
         return None
 
 
 def nessus_session_from_headers(headers: Any) -> dict[str, Any] | None:
-    """Validate Nessus credentials (API keys, session cookie, or HTTP Basic)."""
+    """Validate Nessus API keys via GET /session on the Nessus REST API."""
     api_keys = headers.get("X-ApiKeys", "").strip()
-    cookie = headers.get("X-Cookie", "").strip()
-    if api_keys:
-        try:
-            return fetch_nessus_session({"X-ApiKeys": api_keys})
-        except NessusUnreachable:
-            return None
-    if cookie:
-        try:
-            return fetch_nessus_session({"X-Cookie": cookie})
-        except NessusUnreachable:
-            return None
-
-    basic = parse_basic_auth_header(headers.get("Authorization", ""))
-    if basic:
-        return nessus_session_from_basic(basic[0], basic[1])
-    return None
+    if not api_keys:
+        return None
+    return fetch_nessus_session({"X-ApiKeys": api_keys})
 
 
 def is_nessus_admin(session: dict[str, Any]) -> bool:
@@ -823,7 +711,7 @@ class OperatorHandler(BaseHTTPRequestHandler):
         if not session:
             self._json_response(401, {
                 "error": "Unauthorized",
-                "hint": "Use X-ApiKeys, X-Cookie, or Authorization: Basic (username:password)",
+                "hint": "Use X-ApiKeys: accessKey=...; secretKey=... (admin keys for POST/DELETE)",
             })
             return None
         if admin and not is_nessus_admin(session):
@@ -985,7 +873,7 @@ def main() -> None:
     host = os.environ.get("NESSUS_MANAGE_BIND", "0.0.0.0")
     port = int(os.environ.get("NESSUS_MANAGE_PORT", "8080"))
     server = ThreadingHTTPServer((host, port), OperatorHandler)
-    log(f"Listening on {host}:{port} (prefix {API_PREFIX}, auth: X-ApiKeys / X-Cookie / Basic)")
+    log(f"Listening on {host}:{port} (prefix {API_PREFIX}, auth: X-ApiKeys only)")
     server.serve_forever()
 
 

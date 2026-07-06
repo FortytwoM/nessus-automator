@@ -84,7 +84,7 @@ nessus:
 | `POST` | `/manage/v1/update/cancel` | **admin** key | Cancel current update |
 | `GET` | `/manage/v1/update/status` | Nessus keys | Update status |
 
-Authorization header:
+Auth header (Nessus API keys only):
 
 ```http
 X-ApiKeys: accessKey=...; secretKey=...
@@ -334,11 +334,10 @@ Older feeds may start with `1f 8b` (gzip). `nessuscli update` accepts both forma
 
 **Scheduled plugin push (orchestrator):**
 
-- Poll `GET /manage/v1/health` **without auth** before pushing.
-- If `update_in_progress: true` or `ready: false` — wait; do not treat as failure.
-- `POST /manage/v1/update` returns **409** while bootstrap or another update runs — poll status/health instead of retrying every minute.
-- For Operator API during engine restarts, prefer **`Authorization: Basic`** with the same `NESSUS_USERNAME` / `NESSUS_PASSWORD` as the Nessus container `.env`. API keys require a live Nessus `/session` and return **401** while the engine is stopped for `update.sh`.
-- **401** with wrong credentials: fix the orchestrator profile (`nessus-home`) — password must match Nessus `.env` exactly.
+- Poll `GET /manage/v1/health` **without auth** while Nessus is restarting or compiling (`ready: false`, `update_in_progress: true`).
+- Do not call authenticated Operator endpoints until `ready: true` and Nessus accepts `GET /session` with your API keys — otherwise **401** is expected.
+- `POST /manage/v1/update` returns **409** while bootstrap or another update runs — poll `/health` or `/manage/v1/update/status` instead of retrying every minute.
+- Operator API accepts **`X-ApiKeys` only** (same keys as Nessus REST: UI → My Account → API Keys). Admin keys required for `POST`/`DELETE` on hold and update.
 
 ### When update runs
 
