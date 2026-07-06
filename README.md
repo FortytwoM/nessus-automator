@@ -332,6 +332,14 @@ Older feeds may start with `1f 8b` (gzip). `nessuscli update` accepts both forma
 
 `ready: true` means Nessus is ready for scans (`engine_status=ready` and `pluginData=true`). The orchestrator does not need to parse `/server/status`.
 
+**Scheduled plugin push (orchestrator):**
+
+- Poll `GET /manage/v1/health` **without auth** before pushing.
+- If `update_in_progress: true` or `ready: false` — wait; do not treat as failure.
+- `POST /manage/v1/update` returns **409** while bootstrap or another update runs — poll status/health instead of retrying every minute.
+- For Operator API during engine restarts, prefer **`Authorization: Basic`** with the same `NESSUS_USERNAME` / `NESSUS_PASSWORD` as the Nessus container `.env`. API keys require a live Nessus `/session` and return **401** while the engine is stopped for `update.sh`.
+- **401** with wrong credentials: fix the orchestrator profile (`nessus-home`) — password must match Nessus `.env` exactly.
+
 ### When update runs
 
 | Event | Who triggers it |

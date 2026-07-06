@@ -487,11 +487,14 @@ def nessus_status_fields(status: dict[str, Any]) -> dict[str, Any]:
 def build_health_payload() -> dict[str, Any]:
     st = read_state()
     nessus = nessus_status_fields(fetch_server_status())
+    in_progress = update_running()
     return {
         "status": "ok",
         "operator_version": OPERATOR_VERSION,
-        "update_state": st.get("state", "idle"),
-        "update_in_progress": update_running(),
+        "update_state": "running" if in_progress and st.get("state") == "idle" else st.get("state", "idle"),
+        "update_in_progress": in_progress,
+        "update_started_at": st.get("started_at"),
+        "update_message": st.get("message"),
         "hold_active": HOLD_FILE.is_file(),
         **nessus,
     }
@@ -641,6 +644,24 @@ _basic_auth_cache: dict[tuple[str, str], tuple[str, float]] = {}
 _BASIC_AUTH_CACHE_TTL = 300
 
 
+class NessusUnreachable(Exception):
+    """Nessus REST API is not reachable (engine stopped during update, etc.)."""
+
+
+def credentials_match_env(username: str, password: str) -> bool:
+    env_user = os.environ.get("NESSUS_USERNAME", "admin")
+    env_pass = os.environ.get("NESSUS_PASSWORD", "admin")
+    return username == env_user and password == env_pass
+
+
+def synthetic_admin_session(username: str) -> dict[str, Any]:
+    return {
+        "permissions": ADMIN_PERMISSION,
+        "type": "administrator",
+        "name": username,
+    }
+
+
 def fetch_nessus_session(req_headers: dict[str, str]) -> dict[str, Any] | None:
     req = urllib.request.Request(
         f"{NESSUS_API_BASE}/session",
@@ -653,8 +674,12 @@ def fetch_nessus_session(req_headers: dict[str, str]) -> dict[str, Any] | None:
             if not isinstance(data, dict) or data.get("error"):
                 return None
             return data
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, OSError):
+    except urllib.error.HTTPError:
         return None
+    except urllib.error.URLError as exc:
+        raise NessusUnreachable(str(exc.reason)) from exc
+    except (json.JSONDecodeError, OSError) as exc:
+        raise NessusUnreachable(str(exc)) from exc
 
 
 def nessus_login_token(username: str, password: str) -> str | None:
@@ -673,16 +698,13 @@ def nessus_login_token(username: str, password: str) -> str | None:
             token = data.get("token")
             return str(token).strip() if token else None
     except urllib.error.HTTPError as exc:
-        try:
-            body = exc.read().decode("utf-8", errors="replace")
-            data = json.loads(body)
-            if isinstance(data, dict) and data.get("error"):
-                return None
-        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
-            pass
-        return None
-    except (urllib.error.URLError, json.JSONDecodeError, OSError):
-        return None
+        if exc.code in {401, 403}:
+            return None
+        raise NessusUnreachable(f"Nessus session HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise NessusUnreachable(str(exc.reason)) from exc
+    except (json.JSONDecodeError, OSError) as exc:
+        raise NessusUnreachable(str(exc)) from exc
 
 
 def parse_basic_auth_header(value: str) -> tuple[str, str] | None:
@@ -706,15 +728,30 @@ def nessus_session_from_basic(username: str, password: str) -> dict[str, Any] | 
     now = time.time()
     cached = _basic_auth_cache.get(cache_key)
     if cached and now - cached[1] < _BASIC_AUTH_CACHE_TTL:
-        session = fetch_nessus_session({"X-Cookie": f"token={cached[0]}"})
-        if session:
-            return session
+        try:
+            session = fetch_nessus_session({"X-Cookie": f"token={cached[0]}"})
+            if session:
+                return session
+        except NessusUnreachable:
+            if credentials_match_env(username, password):
+                return synthetic_admin_session(username)
 
-    token = nessus_login_token(username, password)
+    try:
+        token = nessus_login_token(username, password)
+    except NessusUnreachable:
+        if credentials_match_env(username, password):
+            return synthetic_admin_session(username)
+        return None
+
     if not token:
         return None
     _basic_auth_cache[cache_key] = (token, now)
-    return fetch_nessus_session({"X-Cookie": f"token={token}"})
+    try:
+        return fetch_nessus_session({"X-Cookie": f"token={token}"})
+    except NessusUnreachable:
+        if credentials_match_env(username, password):
+            return synthetic_admin_session(username)
+        return None
 
 
 def nessus_session_from_headers(headers: Any) -> dict[str, Any] | None:
@@ -722,9 +759,15 @@ def nessus_session_from_headers(headers: Any) -> dict[str, Any] | None:
     api_keys = headers.get("X-ApiKeys", "").strip()
     cookie = headers.get("X-Cookie", "").strip()
     if api_keys:
-        return fetch_nessus_session({"X-ApiKeys": api_keys})
+        try:
+            return fetch_nessus_session({"X-ApiKeys": api_keys})
+        except NessusUnreachable:
+            return None
     if cookie:
-        return fetch_nessus_session({"X-Cookie": cookie})
+        try:
+            return fetch_nessus_session({"X-Cookie": cookie})
+        except NessusUnreachable:
+            return None
 
     basic = parse_basic_auth_header(headers.get("Authorization", ""))
     if basic:
@@ -824,7 +867,14 @@ class OperatorHandler(BaseHTTPRequestHandler):
 
         if path == f"{API_PREFIX}/update" and method == "POST":
             if update_running() or (_update_thread and _update_thread.is_alive()):
-                self._json_response(409, {"error": "Update already in progress"})
+                st = read_state()
+                self._json_response(409, {
+                    "error": "Update already in progress",
+                    "in_progress": True,
+                    "update_state": st.get("state", "running"),
+                    "started_at": st.get("started_at"),
+                    "hint": "Poll GET /manage/v1/health (no auth) or /manage/v1/update/status",
+                })
                 return
             content_type = self.headers.get("Content-Type", "")
             try:
