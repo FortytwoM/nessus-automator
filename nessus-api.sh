@@ -4,7 +4,7 @@
 # shellcheck source=/dev/null
 [ -f /usr/local/bin/nessus-config.sh ] && . /usr/local/bin/nessus-config.sh
 
-NESSUS_API_BASE="${NESSUS_API_BASE:-https://localhost:8834}"
+NESSUS_API_BASE="${NESSUS_API_BASE:-https://127.0.0.1:${NESSUS_BACKEND_PORT:-8835}}"
 _NESSUS_CACHED_TOKEN=""
 _NESSUS_CACHED_TOKEN_AT=0
 _NESSUS_LAST_SCAN_LOG_AT=-999

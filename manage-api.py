@@ -39,7 +39,7 @@ HOLD_FILE = Path(os.environ.get(
 LOCK_FILE = Path("/tmp/nessus_update.lock")
 API_PREFIX = "/manage/v1"
 OPERATOR_VERSION = "2.2"
-NESSUS_API_BASE = os.environ.get("NESSUS_API_BASE", "https://127.0.0.1:8834").rstrip("/")
+NESSUS_API_BASE = os.environ.get("NESSUS_API_BASE", "https://127.0.0.1:8835").rstrip("/")
 ADMIN_PERMISSION = int(os.environ.get("NESSUS_MANAGE_ADMIN_PERMISSION", "128"))
 _state_lock = threading.Lock()
 _proc_lock = threading.Lock()
@@ -870,7 +870,7 @@ class OperatorHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    host = os.environ.get("NESSUS_MANAGE_BIND", "0.0.0.0")
+    host = os.environ.get("NESSUS_MANAGE_BIND", "127.0.0.1")
     port = int(os.environ.get("NESSUS_MANAGE_PORT", "8080"))
     server = ThreadingHTTPServer((host, port), OperatorHandler)
     log(f"Listening on {host}:{port} (prefix {API_PREFIX}, auth: X-ApiKeys only)")

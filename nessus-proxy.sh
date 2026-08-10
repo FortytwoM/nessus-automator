@@ -1,6 +1,6 @@
 # Sourced by docker-entrypoint.sh, patch.sh, update.sh.
 # NESSUS_* vars are optional: unset = we do not set outbound proxy ourselves.
-# Local Nessus (https://127.0.0.1:8834) must not use Docker/host HTTP(S)_PROXY.
+# Local Nessus backend must not use Docker/host HTTP(S)_PROXY.
 
 nessus_export_proxy() {
     local hp="${NESSUS_HTTP_PROXY:-}"

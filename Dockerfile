@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     sqlite3 \
     dos2unix \
     expect \
+    iproute2 \
     iputils-ping \
     procps \
     jq \
@@ -41,7 +42,7 @@ RUN dos2unix /usr/local/bin/patch.sh \
     /usr/local/bin/manage-api.py \
     && chmod 644 /usr/local/bin/nessus-proxy.sh
 
-EXPOSE 8834 8080
+EXPOSE 8835 8080
 
 STOPSIGNAL SIGTERM
 

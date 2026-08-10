@@ -2,6 +2,8 @@
 
 Docker wrapper for Tenable Nessus: installation, feed patching, plugin updates, and **remote management** through a single HTTPS port.
 
+> **Platform:** Linux Docker host is required. The stack uses host networking so Nessus can bind scan traffic to physical host interfaces.
+
 ## What's inside
 
 | Component | Purpose |
@@ -232,8 +234,8 @@ Client (browser / orchestrator / curl)
 /manage/v1/*       /scans, /session, UI
      │                 │
      ▼                 ▼
-operator-api      Nessus :8834
-:8080 (internal)  (internal)
+operator-api      Nessus :8835
+127.0.0.1:8080    127.0.0.1 (internal)
 ```
 
 Update inside the container **does not run on a schedule** — only via operator API (`POST /manage/v1/update`), manually (`docker exec … update.sh`), or once on first start (bootstrap, if a plugin source is configured).
@@ -265,6 +267,17 @@ If the password is “stuck” on an old value (e.g. `admin` from the first run 
 
 `admin` and `changeme` are blocked by default. For a fully disposable lab setup,
 set `NESSUS_ALLOW_DEFAULT_PASSWORD=1`.
+
+### Scan source IP (multi-homed host)
+
+On a host with several NICs, set which local address(es) Nessus uses for scan traffic (`source_ip`):
+
+```env
+NESSUS_SOURCE_IP=192.168.10.50
+# or: NESSUS_SOURCE_IP=192.168.10.50,10.0.0.20
+```
+
+The stack uses `network_mode: host`; therefore these must be IPs assigned to physical interfaces of the Linux host. Startup fails instead of silently scanning through another interface when a configured IP is not present. Nessus listens internally on `127.0.0.1:8835`, while nginx remains the only public listener on `:8834`.
 
 ### Plugin source (pick one)
 

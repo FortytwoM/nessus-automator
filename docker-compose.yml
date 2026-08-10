@@ -7,18 +7,13 @@ services:
     env_file:
       - path: .env
         required: false
-    expose:
-      - "8834"
-      - "8080"
+    network_mode: host
     cap_add:
-      - NET_ADMIN
       - NET_RAW
       - LINUX_IMMUTABLE
     volumes:
       - nessus_data:/opt/nessus
       - ./packages:/mnt/nessus:ro
-    networks:
-      - nessus_internal
     logging:
       driver: json-file
       options:
@@ -41,10 +36,7 @@ services:
     env_file:
       - path: .env
         required: false
-    ports:
-      - "8834:8834"
-    networks:
-      - nessus_internal
+    network_mode: host
     logging:
       driver: json-file
       options:
@@ -56,10 +48,6 @@ services:
       timeout: 15s
       retries: 5
       start_period: ${NESSUS_HEALTH_START_PERIOD:-1800}s
-
-networks:
-  nessus_internal:
-    driver: bridge
 
 volumes:
   nessus_data:

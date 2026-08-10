@@ -403,7 +403,7 @@ log "Compiling plugins (timeout ${NESSUS_READY_TIMEOUT:-1800}s, this may take se
 waited=0
 max_wait="${NESSUS_READY_TIMEOUT:-1800}"
 while [ $waited -lt $max_wait ]; do
-    status=$(curl -sL -k https://localhost:8834/server/status 2>/dev/null)
+    status=$(curl -sL -k "${NESSUS_API_BASE}/server/status" 2>/dev/null)
     if [ -n "$status" ]; then
         engine_state=$(echo "$status" | grep -o '"engine_status":{[^}]*}' | grep -o '"status":"[^"]*"' | cut -d'"' -f4)
         plugin_data=$(echo "$status" | sed -n 's/.*"pluginData"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' | head -1)
@@ -428,7 +428,7 @@ while [ $waited -lt $max_wait ]; do
             waited2=0
             max_wait2="${NESSUS_READY_RETRY_TIMEOUT:-600}"
             while [ $waited2 -lt $max_wait2 ]; do
-                status=$(curl -sL -k https://localhost:8834/server/status 2>/dev/null)
+                status=$(curl -sL -k "${NESSUS_API_BASE}/server/status" 2>/dev/null)
                 if [ -n "$status" ]; then
                     engine_state=$(echo "$status" | grep -o '"engine_status":{[^}]*}' | grep -o '"status":"[^"]*"' | cut -d'"' -f4)
                     plugin_data=$(echo "$status" | sed -n 's/.*"pluginData"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' | head -1)

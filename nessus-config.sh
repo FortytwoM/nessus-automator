@@ -53,11 +53,20 @@ export NESSUS_UPDATE_SKIP_SCAN_CHECK="${NESSUS_UPDATE_SKIP_SCAN_CHECK:-0}"
 
 # --- Operator API (/manage/v1/* via gateway; auth = Nessus API keys) ---
 export NESSUS_MANAGE_API="${NESSUS_MANAGE_API:-1}"
-export NESSUS_MANAGE_BIND="${NESSUS_MANAGE_BIND:-0.0.0.0}"
+export NESSUS_MANAGE_BIND="${NESSUS_MANAGE_BIND:-127.0.0.1}"
 export NESSUS_MANAGE_PORT="${NESSUS_MANAGE_PORT:-8080}"
+
+# --- Host networking (gateway :8834 -> local Nessus backend) ---
+export NESSUS_BACKEND_PORT="${NESSUS_BACKEND_PORT:-8835}"
+export NESSUS_LISTEN_ADDRESS="${NESSUS_LISTEN_ADDRESS:-127.0.0.1}"
+export NESSUS_API_BASE="${NESSUS_API_BASE:-https://127.0.0.1:${NESSUS_BACKEND_PORT}}"
 
 # --- TLS ---
 export NESSUS_CERT_SAN="${NESSUS_CERT_SAN:-}"
+
+# --- Scan source IP(s) on multi-homed hosts (nessuscli: source_ip) ---
+# Comma-separated list; empty = Nessus default (OS routing).
+export NESSUS_SOURCE_IP="${NESSUS_SOURCE_IP:-}"
 
 # --- Outbound proxy (optional) ---
 export NESSUS_PROXY="${NESSUS_PROXY:-}"

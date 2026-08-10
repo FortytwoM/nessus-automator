@@ -10,7 +10,7 @@ check_nessus_alive() {
     local status engine_state plugin_data
 
     status=$(curl -sf -k --connect-timeout 3 --max-time 15 \
-        https://localhost:8834/server/status 2>/dev/null) || return 1
+        "${NESSUS_API_BASE}/server/status" 2>/dev/null) || return 1
 
     if [ "${NESSUS_HEALTH_STRICT:-0}" = "1" ]; then
         engine_state=$(echo "$status" | grep -o '"engine_status":{[^}]*}' \

@@ -163,7 +163,7 @@ nessus_verify_api_login() {
     fi
 
     response=$(curl -s -k --connect-timeout 5 --max-time 15 \
-        -X POST "https://localhost:8834/session" \
+        -X POST "${NESSUS_API_BASE:-https://127.0.0.1:${NESSUS_BACKEND_PORT:-8835}}/session" \
         -H "Content-Type: application/json" \
         -d "$payload" 2>/dev/null) || return 1
 

@@ -26,7 +26,7 @@ get_display_url() {
 }
 
 get_status() {
-    curl -sL -k https://localhost:8834/server/status 2>/dev/null
+    curl -sL -k "${NESSUS_API_BASE}/server/status" 2>/dev/null
 }
 
 # /server/status JSON may use spaces after ":"; naive cut/grep breaks pluginData / pluginSet checks.
@@ -77,7 +77,7 @@ wait_for_nessus() {
 
     log "Waiting for Nessus service to respond..."
     while [ $attempt -lt $max_attempts ]; do
-        if curl -k -s -f https://localhost:8834/server/status > /dev/null 2>&1; then
+        if curl -k -s -f "${NESSUS_API_BASE}/server/status" > /dev/null 2>&1; then
             log "  Nessus is responding"
             return 0
         fi
@@ -510,8 +510,10 @@ if ! install_nessus; then
     exit 1
 fi
 
+configured_api_base="${NESSUS_API_BASE}"
 if [ ! -f /opt/nessus/var/nessus/global.db ] || [ ! -s /opt/nessus/var/nessus/global.db ]; then
     log "Initializing database..."
+    export NESSUS_API_BASE="https://127.0.0.1:8834"
     start_nessus
     wait_for_nessus 120 || { log "Error: DB init failed"; exit 1; }
     sleep 5
@@ -521,6 +523,12 @@ else
     log "Applying patch..."
     /usr/local/bin/patch.sh 2>&1 || true
     stop_nessus
+fi
+
+export NESSUS_API_BASE="$configured_api_base"
+if ! /usr/local/bin/configure-nessus.sh --startup; then
+    log "Fatal: Failed to configure host networking or scan source IP"
+    exit 1
 fi
 
 ensure_nessusd_rules
@@ -540,12 +548,6 @@ fi
 start_operator_api
 
 nessus_load_api_credentials
-
-/usr/local/bin/configure-nessus.sh
-if ! pgrep -f "nessus-service" > /dev/null 2>&1; then
-    start_nessus
-    wait_for_nessus || exit 1
-fi
 
 print_startup_banner
 bootstrap_plugins_async
