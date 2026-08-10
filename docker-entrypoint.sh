@@ -511,13 +511,14 @@ if ! install_nessus; then
 fi
 
 configured_api_base="${NESSUS_API_BASE}"
+new_database=0
 if [ ! -f /opt/nessus/var/nessus/global.db ] || [ ! -s /opt/nessus/var/nessus/global.db ]; then
+    new_database=1
     log "Initializing database..."
     export NESSUS_API_BASE="https://127.0.0.1:8834"
     start_nessus
     wait_for_nessus 120 || { log "Error: DB init failed"; exit 1; }
     sleep 5
-    stop_nessus
     log "Database: ready"
 else
     log "Applying patch..."
@@ -525,11 +526,15 @@ else
     stop_nessus
 fi
 
-export NESSUS_API_BASE="$configured_api_base"
 if ! /usr/local/bin/configure-nessus.sh --startup; then
     log "Fatal: Failed to configure host networking or scan source IP"
+    [ "$new_database" -eq 1 ] && stop_nessus
     exit 1
 fi
+if [ "$new_database" -eq 1 ]; then
+    stop_nessus
+fi
+export NESSUS_API_BASE="$configured_api_base"
 
 ensure_nessusd_rules
 generate_nessus_cert

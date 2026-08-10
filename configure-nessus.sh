@@ -15,14 +15,16 @@ set_fix_with_retries() {
     local attempts="${3:-12}"
     local delay="${4:-2}"
     local n=0
+    local output=""
 
     while [ $n -lt $attempts ]; do
-        if /opt/nessus/sbin/nessuscli fix --set "${key}=${value}" >/dev/null 2>&1; then
+        if output=$(/opt/nessus/sbin/nessuscli fix --set "${key}=${value}" 2>&1); then
             return 0
         fi
         n=$((n + 1))
         sleep "$delay"
     done
+    log "Error: nessuscli could not set '${key}': ${output:-no error output}"
     return 1
 }
 
@@ -31,14 +33,16 @@ delete_fix_with_retries() {
     local attempts="${2:-12}"
     local delay="${3:-2}"
     local n=0
+    local output=""
 
     while [ $n -lt "$attempts" ]; do
-        if /opt/nessus/sbin/nessuscli fix --delete "$key" >/dev/null 2>&1; then
+        if output=$(/opt/nessus/sbin/nessuscli fix --delete "$key" 2>&1); then
             return 0
         fi
         n=$((n + 1))
         sleep "$delay"
     done
+    log "Error: nessuscli could not delete '${key}': ${output:-no error output}"
     return 1
 }
 
