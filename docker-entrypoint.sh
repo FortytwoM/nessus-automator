@@ -91,6 +91,33 @@ wait_for_nessus() {
     return 1
 }
 
+wait_for_bootstrap_nessus() {
+    local configured_base="$1"
+    local max_attempts="${2:-120}"
+    local attempt=0
+    local base
+
+    log "Waiting for Nessus database initialization..."
+    while [ "$attempt" -lt "$max_attempts" ]; do
+        for base in "https://127.0.0.1:8834" "$configured_base"; do
+            [ -n "$base" ] || continue
+            if curl -k -s -f "${base}/server/status" >/dev/null 2>&1; then
+                export NESSUS_API_BASE="$base"
+                log "  Nessus bootstrap API is responding at ${base}"
+                return 0
+            fi
+        done
+        attempt=$((attempt + 1))
+        if [ $((attempt % 6)) -eq 0 ]; then
+            log "  Still initializing... (${attempt}/${max_attempts})"
+        fi
+        sleep 5
+    done
+
+    log "Error: Nessus bootstrap API did not respond"
+    return 1
+}
+
 stop_nessus() {
     pkill -f "nessus-service" 2>/dev/null || true
     pkill -f "nessusd" 2>/dev/null || true
@@ -511,30 +538,37 @@ if ! install_nessus; then
 fi
 
 configured_api_base="${NESSUS_API_BASE}"
-new_database=0
 if [ ! -f /opt/nessus/var/nessus/global.db ] || [ ! -s /opt/nessus/var/nessus/global.db ]; then
-    new_database=1
     log "Initializing database..."
     export NESSUS_API_BASE="https://127.0.0.1:8834"
     start_nessus
-    wait_for_nessus 120 || { log "Error: DB init failed"; exit 1; }
-    sleep 5
-    log "Database: ready"
 else
     log "Applying patch..."
     /usr/local/bin/patch.sh 2>&1 || true
     stop_nessus
 fi
 
+if [ ! -f /opt/nessus/var/nessus/.nessus_configured ]; then
+    log "Completing initial Nessus database setup..."
+    start_nessus
+    if ! wait_for_bootstrap_nessus "$configured_api_base" 120; then
+        stop_nessus
+        exit 1
+    fi
+    if ! ensure_admin_user log; then
+        log "Fatal: Database initialization did not complete"
+        stop_nessus
+        exit 1
+    fi
+    stop_nessus
+    log "Database: ready"
+fi
+
+export NESSUS_API_BASE="$configured_api_base"
 if ! /usr/local/bin/configure-nessus.sh --startup; then
     log "Fatal: Failed to configure host networking or scan source IP"
-    [ "$new_database" -eq 1 ] && stop_nessus
     exit 1
 fi
-if [ "$new_database" -eq 1 ]; then
-    stop_nessus
-fi
-export NESSUS_API_BASE="$configured_api_base"
 
 ensure_nessusd_rules
 generate_nessus_cert
