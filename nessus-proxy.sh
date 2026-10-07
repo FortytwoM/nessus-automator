@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Sourced by docker-entrypoint.sh, patch.sh, update.sh.
 # NESSUS_* vars are optional: unset = we do not set outbound proxy ourselves.
 # Local Nessus backend must not use Docker/host HTTP(S)_PROXY.
