@@ -6,10 +6,10 @@ from __future__ import annotations
 import json
 import mmap
 import os
-import shutil
 import signal
 import ssl
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -18,52 +18,94 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import urlparse
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from nessus_status_lib import typed_status  # noqa: E402
+from nessus_url_policy import host_allowed, redact_url  # noqa: E402
 
 STATE_FILE = Path(os.environ.get(
     "NESSUS_MANAGE_STATE_FILE", "/opt/nessus/var/nessus/.manage_update_state.json"
 ))
 UPDATE_SCRIPT = "/usr/local/bin/update.sh"
 UPLOAD_DIR = Path(os.environ.get(
-    "NESSUS_MANAGE_UPLOAD_DIR", "/opt/nessus/var/nessus/incoming"
+    "NESSUS_MANAGE_UPLOAD_DIR", "/var/lib/nessus-downloads/incoming"
 ))
-MAX_UPLOAD_BYTES = int(os.environ.get("NESSUS_MANAGE_MAX_UPLOAD_BYTES", str(2 * 1024 ** 3)))
+MAX_UPLOAD_BYTES = int(os.environ.get("NESSUS_MANAGE_MAX_UPLOAD_BYTES", str(1024 ** 3)))
+MAX_JSON_BODY_BYTES = int(os.environ.get("NESSUS_MANAGE_MAX_JSON_BYTES", str(64 * 1024)))
+MAX_SIGNATURE_BYTES = int(os.environ.get("NESSUS_MANAGE_MAX_SIGNATURE_BYTES", str(1024 * 1024)))
+ARCHIVE_FILE_FIELDS = {"archive", "file", "update_file"}
+SIGNATURE_FILE_FIELDS = {"signature", "sig", "signature_file"}
+DOWNLOAD_DIR = Path(os.environ.get("NESSUS_DOWNLOAD_DIR", "/var/lib/nessus-downloads"))
 ALLOWED_ARCHIVE_ROOTS = (
     Path("/mnt/nessus"),
-    Path("/opt/nessus/var/nessus/incoming"),
-    Path("/tmp"),
+    DOWNLOAD_DIR,
 )
+ALLOWED_DOWNLOAD_SCHEMES = {
+    item.strip().lower()
+    for item in os.environ.get("NESSUS_DOWNLOAD_ALLOWED_SCHEMES", "https").split(",")
+    if item.strip()
+}
+ALLOWED_DOWNLOAD_HOSTS = {
+    item.strip().lower().rstrip(".")
+    for item in os.environ.get(
+        "NESSUS_DOWNLOAD_ALLOWED_HOSTS", "plugins.nessus.org,*.tenable.com"
+    ).split(",")
+    if item.strip()
+}
+ALLOWED_DOWNLOAD_PORTS = {
+    int(item.strip())
+    for item in os.environ.get("NESSUS_DOWNLOAD_ALLOWED_PORTS", "443").split(",")
+    if item.strip()
+}
 HOLD_FILE = Path(os.environ.get(
     "NESSUS_UPDATE_HOLD_FILE", "/opt/nessus/var/nessus/.update_hold"
 ))
 LOCK_FILE = Path("/tmp/nessus_update.lock")
+BOOTSTRAP_READY_FILE = Path(os.environ.get(
+    "NESSUS_BOOTSTRAP_READY_FILE", "/tmp/nessus_bootstrap_ready"
+))
+PLUGIN_SET_FILE = Path("/opt/nessus/var/nessus/.plugin_set_last")
+UPDATE_SUCCESS_FILE = Path(os.environ.get(
+    "NESSUS_UPDATE_SUCCESS_FILE", "/opt/nessus/var/nessus/.update_success_epoch"
+))
+SCHEDULER_STATE_FILE = Path(os.environ.get(
+    "NESSUS_UPDATE_SCHEDULER_STATE_FILE",
+    "/opt/nessus/var/nessus/.update_scheduler_state.json",
+))
 API_PREFIX = "/manage/v1"
-OPERATOR_VERSION = "2.2"
+OPERATOR_VERSION = "2.5"
 NESSUS_API_BASE = os.environ.get("NESSUS_API_BASE", "https://127.0.0.1:8835").rstrip("/")
 ADMIN_PERMISSION = int(os.environ.get("NESSUS_MANAGE_ADMIN_PERMISSION", "128"))
 _state_lock = threading.Lock()
 _proc_lock = threading.Lock()
+_update_accept_lock = threading.Lock()
 _update_thread: threading.Thread | None = None
 _update_proc: subprocess.Popen[str] | None = None
-_ssl_ctx = ssl.create_default_context()
-_ssl_ctx.check_hostname = False
-_ssl_ctx.verify_mode = ssl.CERT_NONE
+_update_request_reserved = False
+_scheduler: "UpdateScheduler | None" = None
 
 
-def redact_url(value: str | None) -> str | None:
-    if not value:
-        return value
-    parsed = urlparse(value)
-    if not parsed.scheme or not parsed.netloc:
-        return value
+def _loopback_api_host(value: str) -> bool:
+    host = (urlparse(value).hostname or "").lower()
+    return host in {"127.0.0.1", "localhost", "::1"}
 
-    redacted_query = []
-    for key, item in parse_qsl(parsed.query, keep_blank_values=True):
-        if key.lower() in {"u", "p", "user", "username", "password", "token", "key"}:
-            redacted_query.append((key, "***"))
-        else:
-            redacted_query.append((key, item))
-    return urlunparse(parsed._replace(query=urlencode(redacted_query)))
+
+def _build_ssl_context(api_base: str) -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    if _loopback_api_host(api_base):
+        # The local Nessus backend presents a self-signed certificate; relax
+        # verification only for loopback. A remote NESSUS_API_BASE is verified.
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+_ssl_ctx = _build_ssl_context(NESSUS_API_BASE)
+
 
 
 def log(msg: str) -> None:
@@ -104,6 +146,33 @@ def update_running() -> bool:
         return False
 
 
+def reserve_update_request() -> bool:
+    global _update_request_reserved
+    with _update_accept_lock:
+        if (
+            _update_request_reserved
+            or update_running()
+            or (_update_thread is not None and _update_thread.is_alive())
+        ):
+            return False
+        _update_request_reserved = True
+        return True
+
+
+def release_update_request() -> None:
+    global _update_request_reserved
+    with _update_accept_lock:
+        _update_request_reserved = False
+
+
+def update_in_progress() -> bool:
+    with _update_accept_lock:
+        accepted = _update_request_reserved or (
+            _update_thread is not None and _update_thread.is_alive()
+        )
+    return accepted or update_running()
+
+
 def _read_update_pid() -> int | None:
     if not LOCK_FILE.is_file():
         return None
@@ -111,6 +180,14 @@ def _read_update_pid() -> int | None:
         return int(LOCK_FILE.read_text(encoding="utf-8").strip())
     except (ValueError, OSError):
         return None
+
+
+def update_cancel_wait_seconds() -> int:
+    raw = os.environ.get("NESSUS_UPDATE_CANCEL_WAIT_SECONDS", "180")
+    try:
+        return max(30, min(int(raw), 1800))
+    except ValueError:
+        return 180
 
 
 def cancel_update_job() -> tuple[bool, str]:
@@ -137,7 +214,7 @@ def cancel_update_job() -> tuple[bool, str]:
     if not signalled:
         return False, "Update process not found"
 
-    deadline = time.time() + 15
+    deadline = time.time() + update_cancel_wait_seconds()
     while time.time() < deadline:
         if not update_running():
             break
@@ -157,13 +234,16 @@ def cancel_update_job() -> tuple[bool, str]:
                 _update_proc.kill()
             _update_proc = None
 
-    if LOCK_FILE.is_file():
+    if not update_running() and LOCK_FILE.is_file():
         try:
             LOCK_FILE.unlink()
         except OSError:
             pass
 
     st = read_state()
+    if st.get("state") not in {None, "running"}:
+        return True, str(st.get("message") or "Update cancelled")
+
     write_state({
         **st,
         "state": "cancelled",
@@ -203,6 +283,25 @@ def safe_archive_path(value: str) -> Path | None:
     return None
 
 
+def validate_update_url(value: str) -> str:
+    parsed = urlparse(value)
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if scheme not in ALLOWED_DOWNLOAD_SCHEMES:
+        raise ValueError(f"source URL scheme '{scheme or '<empty>'}' is not allowed")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("source URL userinfo is not allowed")
+    if not host or not host_allowed(host, ALLOWED_DOWNLOAD_HOSTS):
+        raise ValueError(f"source URL host '{host or '<empty>'}' is not allowlisted")
+    try:
+        port = parsed.port or (443 if scheme == "https" else 80)
+    except ValueError as exc:
+        raise ValueError(f"invalid source URL port: {exc}") from exc
+    if port not in ALLOWED_DOWNLOAD_PORTS:
+        raise ValueError(f"source URL port {port} is not allowed")
+    return value
+
+
 def resolve_update_archive(body: dict[str, Any]) -> str | None:
     """Local archive path inside container (archive field or local source)."""
     for key in ("archive", "update_file", "file"):
@@ -213,17 +312,21 @@ def resolve_update_archive(body: dict[str, Any]) -> str | None:
             raise ValueError(f"{key} must be a non-empty string path")
         path = safe_archive_path(raw.strip())
         if path is None:
-            raise ValueError(f"{key} must point to an existing file under /mnt/nessus, incoming, or /tmp")
+            raise ValueError(
+                f"{key} must point to an existing file under /mnt/nessus "
+                f"or {DOWNLOAD_DIR}"
+            )
         return str(path)
 
     source = body.get("source")
     if isinstance(source, str) and source.strip():
         parsed = urlparse(source.strip())
-        if parsed.scheme in {"http", "https"}:
+        if parsed.scheme:
+            validate_update_url(source.strip())
             return None
         path = safe_archive_path(source.strip())
         if path is None:
-            raise ValueError("source must be an http(s) URL or a local archive path")
+            raise ValueError("source must be an approved URL or a local archive path")
         return str(path)
     return None
 
@@ -233,8 +336,8 @@ def resolve_update_url(body: dict[str, Any]) -> str | None:
     if not isinstance(source, str) or not source.strip():
         return None
     parsed = urlparse(source.strip())
-    if parsed.scheme in {"http", "https"}:
-        return source.strip()
+    if parsed.scheme:
+        return validate_update_url(source.strip())
     return None
 
 
@@ -322,11 +425,16 @@ def _spool_request_body(fp: Any, length: int, max_length: int) -> Path:
 
 def _parse_multipart_spool(
     spool: Path, content_type: str
-) -> tuple[dict[str, str], tuple[str, int, int] | None]:
+) -> tuple[
+    dict[str, str],
+    tuple[str, int, int] | None,
+    tuple[str, int, int] | None,
+]:
     boundary = _multipart_boundary(content_type)
     marker = b"--" + boundary
     fields: dict[str, str] = {}
     archive: tuple[str, int, int] | None = None
+    signature: tuple[str, int, int] | None = None
 
     with spool.open("rb") as handle:
         mm = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
@@ -362,8 +470,10 @@ def _parse_multipart_spool(
                 part = _parse_content_disposition(disposition)
                 name = part.get("name", "")
                 filename = part.get("filename")
-                if filename and name in {"archive", "file", "update_file"}:
+                if filename and name in ARCHIVE_FILE_FIELDS:
                     archive = (Path(filename).name, body_start, body_end)
+                elif filename and name in SIGNATURE_FILE_FIELDS:
+                    signature = (Path(filename).name, body_start, body_end)
                 elif name:
                     fields[name] = mm[body_start:body_end].decode("utf-8", errors="replace").strip()
 
@@ -371,7 +481,23 @@ def _parse_multipart_spool(
         finally:
             mm.close()
 
-    return fields, archive
+    return fields, archive, signature
+
+
+def _copy_slice(spool: Path, start: int, size: int, dest: Path) -> None:
+    remaining = size
+    with spool.open("rb") as src, dest.open("wb") as dst:
+        src.seek(start)
+        while remaining > 0:
+            chunk = src.read(min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            dst.write(chunk)
+            remaining -= len(chunk)
+
+    if remaining != 0:
+        dest.unlink(missing_ok=True)
+        raise ValueError("uploaded data is truncated")
 
 
 def save_uploaded_slice(spool: Path, filename: str, start: int, end: int) -> Path:
@@ -386,19 +512,28 @@ def save_uploaded_slice(spool: Path, filename: str, start: int, end: int) -> Pat
     safe_name = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in filename)
     dest = UPLOAD_DIR / f"{int(time.time())}_{safe_name}"
 
-    with spool.open("rb") as src, dest.open("wb") as dst:
-        src.seek(start)
-        shutil.copyfileobj(src, dst, length=size)
+    _copy_slice(spool, start, size, dest)
+    return dest
 
+
+def save_signature_slice(spool: Path, start: int, end: int, dest: Path) -> Path:
+    size = end - start
+    if size <= 0:
+        raise ValueError("uploaded signature is empty")
+    if size > MAX_SIGNATURE_BYTES:
+        raise ValueError(f"signature exceeds {MAX_SIGNATURE_BYTES} bytes")
+
+    _copy_slice(spool, start, size, dest)
     return dest
 
 
 def parse_update_request_multipart(handler: Any) -> dict[str, Any]:
     content_type = handler.headers.get("Content-Type", "")
     length = int(handler.headers.get("Content-Length", 0))
-    spool = _spool_request_body(handler.rfile, length, MAX_UPLOAD_BYTES + 65536)
+    spool_limit = MAX_UPLOAD_BYTES + MAX_SIGNATURE_BYTES + 65536
+    spool = _spool_request_body(handler.rfile, length, spool_limit)
     try:
-        fields, archive_part = _parse_multipart_spool(spool, content_type)
+        fields, archive_part, signature_part = _parse_multipart_spool(spool, content_type)
         if archive_part is None:
             raise ValueError("multipart request must include archive file field")
 
@@ -408,6 +543,9 @@ def parse_update_request_multipart(handler: Any) -> dict[str, Any]:
             fields.get("plugin_set") or fields.get("plugin_set_id") or fields.get("feed_id")
         )
         saved = save_uploaded_slice(spool, filename, start, end)
+        if signature_part is not None:
+            _sig_name, sig_start, sig_end = signature_part
+            save_signature_slice(spool, sig_start, sig_end, Path(f"{saved}.sig"))
         return {
             "force": force,
             "plugin_set": plugin_set,
@@ -462,31 +600,33 @@ def fetch_server_status() -> dict[str, Any]:
 
 
 def nessus_status_fields(status: dict[str, Any]) -> dict[str, Any]:
-    engine = status.get("engine_status")
-    engine_state = None
-    engine_progress = None
-    if isinstance(engine, dict):
-        engine_state = engine.get("status")
-        engine_progress = engine.get("progress")
-    plugin_data = status.get("pluginData") is True
-    plugin_set = status.get("pluginSet")
-    if plugin_set is not None:
+    parsed = typed_status(status)
+    plugin_set = parsed["plugin_set"]
+    if plugin_set is None:
+        try:
+            cached_plugin_set = PLUGIN_SET_FILE.read_text(encoding="utf-8").strip()
+        except OSError:
+            cached_plugin_set = ""
+        plugin_set = cached_plugin_set if cached_plugin_set.isdigit() else None
+    else:
         plugin_set = str(plugin_set)
-    ready = engine_state == "ready" and plugin_data
+    strict_health = os.environ.get("NESSUS_HEALTH_STRICT", "1") == "1"
+    bootstrap_ready = not strict_health or BOOTSTRAP_READY_FILE.is_file()
+    ready = parsed["engine_status"] == "ready" and parsed["plugin_data"] and bootstrap_ready
     return {
         "ready": ready,
         "plugin_set": plugin_set,
-        "plugin_data": plugin_data,
-        "engine_status": engine_state,
-        "engine_progress": engine_progress,
-        "nessus_status": status.get("status"),
+        "plugin_data": parsed["plugin_data"],
+        "engine_status": parsed["engine_status"],
+        "engine_progress": parsed["engine_progress"],
+        "nessus_status": parsed["nessus_status"],
     }
 
 
 def build_health_payload() -> dict[str, Any]:
     st = read_state()
     nessus = nessus_status_fields(fetch_server_status())
-    in_progress = update_running()
+    in_progress = update_in_progress()
     return {
         "status": "ok",
         "operator_version": OPERATOR_VERSION,
@@ -495,6 +635,9 @@ def build_health_payload() -> dict[str, Any]:
         "update_started_at": st.get("started_at"),
         "update_message": st.get("message"),
         "hold_active": HOLD_FILE.is_file(),
+        "scheduler": _scheduler.status() if _scheduler is not None else {
+            "enabled": False,
+        },
         **nessus,
     }
 
@@ -506,7 +649,7 @@ def cleanup_incoming_uploads() -> None:
     for path in UPLOAD_DIR.iterdir():
         if not path.is_file():
             continue
-        if path.suffix in {".gz", ".tgz"} or path.name.endswith(".tar.gz"):
+        if path.suffix in {".gz", ".tgz", ".sig"} or path.name.endswith(".tar.gz"):
             try:
                 path.unlink()
                 removed += 1
@@ -516,11 +659,26 @@ def cleanup_incoming_uploads() -> None:
         log(f"Cleaned {removed} file(s) from {UPLOAD_DIR}")
 
 
-def run_update_job(
+def classify_update_exit(exit_code: int) -> tuple[str, str]:
+    if exit_code == 0:
+        return "completed", "Update finished successfully"
+    if exit_code == 2:
+        return "deferred", "Update deferred (scans or hold file)"
+    if exit_code == 3:
+        return "deferred", "Update deferred (another update holds the lock)"
+    if exit_code == 4:
+        return "rolled_back", "Update failed; previous plugins were restored"
+    if exit_code == 130:
+        return "cancelled", "Update cancelled"
+    return "failed", f"Update failed with exit code {exit_code}"
+
+
+def _run_update_job(
     force: bool,
     archive: str | None,
     url: str | None,
     plugin_set: str | None,
+    trigger: str = "api",
 ) -> None:
     global _update_proc
     cmd = [UPDATE_SCRIPT]
@@ -544,6 +702,7 @@ def run_update_job(
         "source": safe_source,
         "archive": archive,
         "plugin_set": plugin_set,
+        "trigger": trigger,
         "exit_code": None,
         "message": None,
     })
@@ -571,31 +730,33 @@ def run_update_job(
         stdout, _ = proc.communicate(timeout=86400)
         exit_code = proc.returncode if proc.returncode is not None else -1
         tail = (stdout or "")[-4000:]
+        state, msg = classify_update_exit(exit_code)
         if exit_code == 0:
-            state = "completed"
-            msg = "Update finished successfully"
             cleanup_incoming_uploads()
-        elif exit_code == 2:
-            state = "deferred"
-            msg = "Update deferred (scans or hold file)"
-        elif exit_code == 130:
-            state = "cancelled"
-            msg = "Update cancelled"
+        if exit_code not in {0, 2, 3}:
+            cleanup_incoming_uploads()
+        current = read_state()
+        if current.get("state") == "cancelled":
+            write_state({
+                **current,
+                "exit_code": exit_code,
+                "log_tail": tail,
+                "in_progress": False,
+            })
         else:
-            state = "failed"
-            msg = f"Update failed with exit code {exit_code}"
-        write_state({
-            "state": state,
-            "started_at": started_at,
-            "finished_at": utc_now(),
-            "force": force,
-            "source": safe_source,
-            "archive": archive,
-            "plugin_set": plugin_set,
-            "exit_code": exit_code,
-            "message": msg,
-            "log_tail": tail,
-        })
+            write_state({
+                "state": state,
+                "started_at": started_at,
+                "finished_at": utc_now(),
+                "force": force,
+                "source": safe_source,
+                "archive": archive,
+                "plugin_set": plugin_set,
+                "trigger": trigger,
+                "exit_code": exit_code,
+                "message": msg,
+                "log_tail": tail,
+            })
         log(msg)
     except subprocess.TimeoutExpired:
         cancel_update_job()
@@ -617,6 +778,204 @@ def run_update_job(
     finally:
         with _proc_lock:
             _update_proc = None
+
+
+def run_update_job(
+    force: bool,
+    archive: str | None,
+    url: str | None,
+    plugin_set: str | None,
+    trigger: str = "api",
+) -> None:
+    """Run one update job, always releasing the request reservation on exit."""
+    try:
+        _run_update_job(force, archive, url, plugin_set, trigger)
+    finally:
+        release_update_request()
+
+
+def parse_update_window(value: str) -> tuple[int, int]:
+    try:
+        start_text, end_text = value.split("-", 1)
+        start_hour, start_minute = (int(item) for item in start_text.split(":", 1))
+        end_hour, end_minute = (int(item) for item in end_text.split(":", 1))
+    except (ValueError, TypeError) as exc:
+        raise ValueError("update window must use HH:MM-HH:MM") from exc
+    if not (
+        0 <= start_hour <= 23
+        and 0 <= end_hour <= 23
+        and 0 <= start_minute <= 59
+        and 0 <= end_minute <= 59
+    ):
+        raise ValueError("update window contains an invalid UTC time")
+    start = start_hour * 60 + start_minute
+    end = end_hour * 60 + end_minute
+    if start == end:
+        raise ValueError("update window start and end must differ")
+    return start, end
+
+
+def within_update_window(now: datetime, window: tuple[int, int]) -> bool:
+    minute = now.hour * 60 + now.minute
+    start, end = window
+    if start < end:
+        return start <= minute < end
+    return minute >= start or minute < end
+
+
+class UpdateScheduler:
+    def __init__(self) -> None:
+        self.window_text = os.environ.get("NESSUS_UPDATE_WINDOW_UTC", "").strip()
+        self.enabled = bool(self.window_text)
+        self.window = parse_update_window(self.window_text) if self.enabled else None
+        self.max_age_hours = self._positive_int(
+            "NESSUS_UPDATE_MAX_FEED_AGE_HOURS",
+            48,
+        )
+        self.retry_initial = self._positive_int(
+            "NESSUS_UPDATE_RETRY_INITIAL_SECONDS",
+            300,
+        )
+        self.retry_max = self._positive_int(
+            "NESSUS_UPDATE_RETRY_MAX_SECONDS",
+            3600,
+        )
+        if self.retry_initial > self.retry_max:
+            raise ValueError(
+                "NESSUS_UPDATE_RETRY_INITIAL_SECONDS cannot exceed retry maximum"
+            )
+
+    @staticmethod
+    def _positive_int(name: str, default: int) -> int:
+        raw = os.environ.get(name, str(default))
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a positive integer") from exc
+        if value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+        return value
+
+    @staticmethod
+    def _read_scheduler_state() -> dict[str, Any]:
+        try:
+            value = json.loads(SCHEDULER_STATE_FILE.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    @staticmethod
+    def _write_scheduler_state(value: dict[str, Any]) -> None:
+        SCHEDULER_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary = SCHEDULER_STATE_FILE.with_suffix(".tmp")
+        temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, SCHEDULER_STATE_FILE)
+
+    @staticmethod
+    def _last_success_epoch() -> int | None:
+        try:
+            value = int(UPDATE_SUCCESS_FILE.read_text(encoding="utf-8").strip())
+            return value if value > 0 else None
+        except (OSError, ValueError):
+            return None
+
+    def status(self) -> dict[str, Any]:
+        if not self.enabled:
+            return {"enabled": False}
+        state = self._read_scheduler_state()
+        next_attempt = state.get("next_attempt_epoch")
+        next_attempt_at = None
+        if isinstance(next_attempt, (int, float)) and next_attempt > 0:
+            next_attempt_at = datetime.fromtimestamp(
+                next_attempt,
+                timezone.utc,
+            ).replace(microsecond=0).isoformat()
+        last_success = self._last_success_epoch()
+        return {
+            "enabled": True,
+            "window_utc": self.window_text,
+            "max_feed_age_hours": self.max_age_hours,
+            "failure_count": state.get("failure_count", 0),
+            "next_attempt_at": next_attempt_at,
+            "last_success_at": (
+                datetime.fromtimestamp(last_success, timezone.utc)
+                .replace(microsecond=0)
+                .isoformat()
+                if last_success
+                else None
+            ),
+        }
+
+    def due(self, now: datetime) -> bool:
+        if not self.enabled or self.window is None:
+            return False
+        if not BOOTSTRAP_READY_FILE.is_file():
+            return False
+        now = now.astimezone(timezone.utc)
+        if not within_update_window(now, self.window):
+            return False
+        state = self._read_scheduler_state()
+        next_attempt = state.get("next_attempt_epoch", 0)
+        if isinstance(next_attempt, (int, float)) and now.timestamp() < next_attempt:
+            return False
+        last_success = self._last_success_epoch()
+        return (
+            last_success is None
+            or now.timestamp() - last_success >= self.max_age_hours * 3600
+        )
+
+    def _run_update(self) -> None:
+        run_update_job(False, None, None, None, trigger="scheduled")
+        update_state = read_state().get("state", "failed")
+        scheduler_state = self._read_scheduler_state()
+        now_epoch = int(time.time())
+        if update_state == "completed":
+            scheduler_state.update({
+                "failure_count": 0,
+                "next_attempt_epoch": now_epoch + self.max_age_hours * 3600,
+            })
+        else:
+            failures = int(scheduler_state.get("failure_count", 0)) + 1
+            delay = min(
+                self.retry_max,
+                self.retry_initial * (2 ** min(failures - 1, 20)),
+            )
+            scheduler_state.update({
+                "failure_count": failures,
+                "next_attempt_epoch": now_epoch + delay,
+            })
+        scheduler_state.update({
+            "last_attempt_epoch": now_epoch,
+            "last_result": update_state,
+        })
+        self._write_scheduler_state(scheduler_state)
+
+    def tick(self, now: datetime | None = None) -> bool:
+        global _update_thread
+        current = now or datetime.now(timezone.utc)
+        if not self.due(current) or not reserve_update_request():
+            return False
+        started = False
+        try:
+            _update_thread = threading.Thread(
+                target=self._run_update,
+                daemon=True,
+                name="scheduled-plugin-update",
+            )
+            _update_thread.start()
+            started = True
+        finally:
+            if not started:
+                release_update_request()
+        return True
+
+    def run_forever(self) -> None:
+        while True:
+            try:
+                self.tick()
+            except Exception as exc:  # noqa: BLE001
+                log(f"Scheduler error: {exc}")
+            time.sleep(60)
 
 
 def active_scans() -> list[dict[str, str]]:
@@ -675,10 +1034,14 @@ class OperatorHandler(BaseHTTPRequestHandler):
     server_version = "NessusOperatorAPI/2.2"
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        path = urlparse(self.path).path.rstrip("/") or "/"
+        if not hasattr(self, "path"):
+            log(f"{self.address_string()} malformed HTTP request rejected")
+            return
+        path = urlparse(getattr(self, "path", "")).path.rstrip("/") or "/"
+        command = getattr(self, "command", "")
         if (
             path == f"{API_PREFIX}/health"
-            and self.command == "GET"
+            and command == "GET"
             and os.environ.get("NESSUS_MANAGE_LOG_HEALTH", "0") != "1"
         ):
             try:
@@ -697,9 +1060,15 @@ class OperatorHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _read_json(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", 0))
+        raw_length = self.headers.get("Content-Length", "0")
+        try:
+            length = int(raw_length)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid Content-Length: {raw_length!r}") from exc
         if length <= 0:
             return {}
+        if length > MAX_JSON_BODY_BYTES:
+            raise ValueError(f"JSON body exceeds {MAX_JSON_BODY_BYTES} bytes")
         raw = self.rfile.read(length)
         data = json.loads(raw.decode("utf-8"))
         if not isinstance(data, dict):
@@ -719,8 +1088,58 @@ class OperatorHandler(BaseHTTPRequestHandler):
             return None
         return session
 
-    def _route(self, method: str) -> None:
+    def _accept_update(self) -> bool:
         global _update_thread
+        content_type = self.headers.get("Content-Type", "")
+        try:
+            if "multipart/form-data" in content_type:
+                params = parse_update_request_multipart(self)
+            else:
+                body = self._read_json()
+                params = parse_update_request_json(body)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+            self._json_response(400, {"error": "Invalid update request", "message": str(exc)})
+            return False
+        params = apply_default_update_source(params)
+        params = apply_env_plugin_set(params)
+        if not params.get("archive") and not params.get("url"):
+            self._json_response(400, {
+                "error": "No update source",
+                "message": (
+                    "Provide archive (path or upload), source URL, "
+                    "packages/all-2.0.tar.gz, or NESSUS_UPDATE_URL"
+                ),
+            })
+            return False
+        try:
+            enforce_plugin_set_for_offline(params)
+        except ValueError as exc:
+            self._json_response(400, {"error": "Invalid update request", "message": str(exc)})
+            return False
+        resolved = "archive" if params.get("archive") else "url"
+        _update_thread = threading.Thread(
+            target=run_update_job,
+            args=(
+                params["force"],
+                params.get("archive"),
+                params.get("url"),
+                params.get("plugin_set"),
+            ),
+            daemon=True,
+        )
+        _update_thread.start()
+        self._json_response(202, {
+            "status": "accepted",
+            "message": "Update started",
+            "force": params["force"],
+            "archive": params.get("archive"),
+            "plugin_set": params.get("plugin_set"),
+            "source": redact_url(params.get("url")) if params.get("url") else params.get("archive"),
+            "resolved_via": resolved,
+        })
+        return True
+
+    def _route(self, method: str) -> None:
         path = urlparse(self.path).path.rstrip("/") or "/"
 
         if path == f"{API_PREFIX}/health" and method == "GET":
@@ -738,12 +1157,12 @@ class OperatorHandler(BaseHTTPRequestHandler):
 
         if path == f"{API_PREFIX}/update/status" and method == "GET":
             st = read_state()
-            st["in_progress"] = update_running()
+            st["in_progress"] = update_in_progress()
             self._json_response(200, st)
             return
 
         if path == f"{API_PREFIX}/update/cancel" and method == "POST":
-            if not update_running() and (_update_thread is None or not _update_thread.is_alive()):
+            if not update_in_progress():
                 st = read_state()
                 if st.get("state") != "running":
                     self._json_response(409, {"error": "No update in progress"})
@@ -754,7 +1173,7 @@ class OperatorHandler(BaseHTTPRequestHandler):
             return
 
         if path == f"{API_PREFIX}/update" and method == "POST":
-            if update_running() or (_update_thread and _update_thread.is_alive()):
+            if not reserve_update_request():
                 st = read_state()
                 self._json_response(409, {
                     "error": "Update already in progress",
@@ -764,53 +1183,12 @@ class OperatorHandler(BaseHTTPRequestHandler):
                     "hint": "Poll GET /manage/v1/health (no auth) or /manage/v1/update/status",
                 })
                 return
-            content_type = self.headers.get("Content-Type", "")
+            started = False
             try:
-                if "multipart/form-data" in content_type:
-                    params = parse_update_request_multipart(self)
-                else:
-                    body = self._read_json()
-                    params = parse_update_request_json(body)
-            except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
-                self._json_response(400, {"error": "Invalid update request", "message": str(exc)})
-                return
-            params = apply_default_update_source(params)
-            params = apply_env_plugin_set(params)
-            if not params.get("archive") and not params.get("url"):
-                self._json_response(400, {
-                    "error": "No update source",
-                    "message": (
-                        "Provide archive (path or upload), source URL, "
-                        "packages/all-2.0.tar.gz, or NESSUS_UPDATE_URL"
-                    ),
-                })
-                return
-            try:
-                enforce_plugin_set_for_offline(params)
-            except ValueError as exc:
-                self._json_response(400, {"error": "Invalid update request", "message": str(exc)})
-                return
-            resolved = "archive" if params.get("archive") else "url"
-            _update_thread = threading.Thread(
-                target=run_update_job,
-                args=(
-                    params["force"],
-                    params.get("archive"),
-                    params.get("url"),
-                    params.get("plugin_set"),
-                ),
-                daemon=True,
-            )
-            _update_thread.start()
-            self._json_response(202, {
-                "status": "accepted",
-                "message": "Update started",
-                "force": params["force"],
-                "archive": params.get("archive"),
-                "plugin_set": params.get("plugin_set"),
-                "source": redact_url(params.get("url")) if params.get("url") else params.get("archive"),
-                "resolved_via": resolved,
-            })
+                started = self._accept_update()
+            finally:
+                if not started:
+                    release_update_request()
             return
 
         if path == f"{API_PREFIX}/hold" and method == "POST":
@@ -870,10 +1248,26 @@ class OperatorHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    global _scheduler
     host = os.environ.get("NESSUS_MANAGE_BIND", "127.0.0.1")
     port = int(os.environ.get("NESSUS_MANAGE_PORT", "8080"))
+    try:
+        _scheduler = UpdateScheduler()
+    except ValueError as exc:
+        raise SystemExit(f"Invalid scheduled update configuration: {exc}") from exc
     server = ThreadingHTTPServer((host, port), OperatorHandler)
     log(f"Listening on {host}:{port} (prefix {API_PREFIX}, auth: X-ApiKeys only)")
+    if _scheduler.enabled:
+        threading.Thread(
+            target=_scheduler.run_forever,
+            daemon=True,
+            name="update-scheduler",
+        ).start()
+        log(
+            "Scheduled updates enabled: "
+            f"window={_scheduler.window_text} UTC, "
+            f"max feed age={_scheduler.max_age_hours}h"
+        )
     server.serve_forever()
 
 

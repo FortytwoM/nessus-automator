@@ -1,0 +1,8 @@
+# Ruff configuration for the Python entrypoints and helper modules.
+# Keep the selection focused on real defects (syntax + pyflakes) so CI is
+# meaningful without blocking on style. Widen `select` after a local pass.
+line-length = 100
+target-version = "py311"
+
+[lint]
+select = ["E9", "F"]

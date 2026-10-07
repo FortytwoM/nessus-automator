@@ -6,11 +6,11 @@ nessus_user_exists() {
     local existing
 
     existing=$(sqlite3 /opt/nessus/var/nessus/global.db "SELECT username FROM Users;" 2>/dev/null) || true
-    if echo "$existing" | grep -q "^${username}$"; then
+    if echo "$existing" | grep -Fxq "$username"; then
         return 0
     fi
 
-    if /opt/nessus/sbin/nessuscli lsuser 2>/dev/null | grep -q "^${username}$"; then
+    if /opt/nessus/sbin/nessuscli lsuser 2>/dev/null | grep -Fxq "$username"; then
         return 0
     fi
 

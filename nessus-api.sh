@@ -66,7 +66,8 @@ nessus_active_scans_report() {
     token=$(nessus_api_token) || return 1
     scans_json=$(nessus_api_get_scans_json "$token") || return 1
 
-    if [ -z "$scans_json" ] || echo "$scans_json" | grep -qi '"error"'; then
+    if [ -z "$scans_json" ] \
+        || ! printf '%s' "$scans_json" | jq -e 'type == "object" and (has("error") | not)' >/dev/null 2>&1; then
         nessus_api_invalidate_token
         token=$(nessus_api_token) || return 1
         scans_json=$(nessus_api_get_scans_json "$token") || return 1
@@ -74,16 +75,11 @@ nessus_active_scans_report() {
 
     [ -n "$scans_json" ] || return 1
 
-    if command -v jq >/dev/null 2>&1; then
-        echo "$scans_json" | jq -r --arg statuses "$NESSUS_ACTIVE_SCAN_STATUSES" '
-            (.scans // [])[]
-            | select(.status as $s | ($statuses | split(" ") | index($s)) != null)
-            | "\(.id)\t\(.name // "unnamed")\t\(.status)"
-        ' 2>/dev/null
-        return 0
-    fi
-
-    echo "$scans_json" | tr ',' '\n' | grep -E '"status":"(running|pending|resuming|canceling|pausing|paused|stopping|initializing)"' || true
+    printf '%s' "$scans_json" | jq -r --arg statuses "$NESSUS_ACTIVE_SCAN_STATUSES" '
+        (.scans // [])[]
+        | select(.status as $s | ($statuses | split(" ") | index($s)) != null)
+        | "\(.id)\t\(.name // "unnamed")\t\(.status)"
+    ' 2>/dev/null
 }
 
 nessus_active_scan_count() {

@@ -1,0 +1,24 @@
+# Docker Desktop does not forward host-network ports to Windows/macOS localhost.
+# nessusctl and scripts/compose-lib.sh attach this overlay automatically.
+services:
+  nessus:
+    network_mode: !reset null
+    environment:
+      NESSUS_LISTEN_ADDRESS: "0.0.0.0"
+      NESSUS_MANAGE_BIND: "0.0.0.0"
+    networks:
+      - nessus
+
+  gateway:
+    network_mode: !reset null
+    environment:
+      NESSUS_BACKEND_HOST: nessus
+      NESSUS_MANAGE_HOST: nessus
+    ports:
+      - "127.0.0.1:8834:8834"
+    networks:
+      - nessus
+
+networks:
+  nessus:
+    driver: bridge

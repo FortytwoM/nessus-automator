@@ -1,9 +1,13 @@
+# Production uses host networking so Nessus can bind scan traffic to a
+# physical host interface. Docker Desktop cannot publish those ports to
+# Windows/macOS localhost; nessusctl and scripts/compose-lib.sh attach
+# docker-compose.desktop.yml in that environment.
 services:
   nessus:
     build: .
     container_name: nessus
     restart: always
-    stop_grace_period: 30s
+    stop_grace_period: 180s
     env_file:
       - path: .env
         required: false
@@ -14,6 +18,8 @@ services:
     volumes:
       - nessus_data:/opt/nessus
       - ./packages:/mnt/nessus:ro
+    tmpfs:
+      - /var/lib/nessus-downloads:size=${NESSUS_DOWNLOAD_FS_SIZE:-2300m},mode=0700
     logging:
       driver: json-file
       options:
@@ -37,13 +43,17 @@ services:
       - path: .env
         required: false
     network_mode: host
+    volumes:
+      - ${GATEWAY_CERT_DIR:-./certs}:/etc/nginx/certs:ro
+    security_opt:
+      - no-new-privileges:true
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "-", "--no-check-certificate", "https://localhost:8834/manage/v1/health"]
+      test: ["CMD-SHELL", "curl --fail --silent --show-error --cacert $${GATEWAY_CA_FILE:-/etc/nginx/certs/ca.pem} https://$${GATEWAY_HEALTH_HOST:-$${GATEWAY_BIND_IP:-127.0.0.1}}:8834/manage/v1/health >/dev/null"]
       interval: 30s
       timeout: 15s
       retries: 5

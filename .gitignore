@@ -2,11 +2,16 @@
 .env
 .env.local
 *.pem
+certs/*
+!certs/.gitkeep
+.private-ca/
 
 # Nessus outputs
 *.log
 *.nessus
 *.pdf
+backups/
+*.partial
 
 # Plugin update artifacts (created inside container)
 all-2.0.tar.gz

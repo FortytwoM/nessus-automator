@@ -2,13 +2,24 @@
 
 LOCK_FILE="/tmp/nessus_update.lock"
 MANAGE_API_PID=""
+BOOTSTRAP_PID=""
 
 # shellcheck source=/dev/null
 [ -f /usr/local/bin/nessus-config.sh ] && . /usr/local/bin/nessus-config.sh
+if ! /usr/local/bin/configure-dns.sh; then
+    echo "[dns] Fatal: resolver configuration failed" >&2
+    exit 1
+fi
 # shellcheck source=/dev/null
 [ -f /usr/local/bin/nessus-proxy.sh ] && . /usr/local/bin/nessus-proxy.sh && nessus_export_proxy
 # shellcheck source=/dev/null
 [ -f /usr/local/bin/nessus-users.sh ] && . /usr/local/bin/nessus-users.sh
+
+mkdir -p "${NESSUS_DOWNLOAD_DIR}" || {
+    echo "Error: Cannot create NESSUS_DOWNLOAD_DIR=${NESSUS_DOWNLOAD_DIR}" >&2
+    exit 1
+}
+chmod 700 "${NESSUS_DOWNLOAD_DIR}" || exit 1
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
@@ -29,18 +40,9 @@ get_status() {
     curl -sL -k "${NESSUS_API_BASE}/server/status" 2>/dev/null
 }
 
-# /server/status JSON may use spaces after ":"; naive cut/grep breaks pluginData / pluginSet checks.
-status_plugin_data() {
-    echo "$1" | sed -n 's/.*"pluginData"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' | head -1
-}
-
-status_plugin_set() {
-    echo "$1" | sed -n 's/.*"pluginSet"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
-}
-
-get_status_field() {
-    local field="$1"
-    get_status | grep -o "\"$field\":[^,}]*" | cut -d: -f2 | tr -d '"' | head -1
+status_field() {
+    local status="$1" field="$2"
+    printf '%s' "$status" | /usr/local/bin/nessus-status.py --field "$field" 2>/dev/null
 }
 
 wait_for_ready() {
@@ -48,12 +50,12 @@ wait_for_ready() {
     local waited=0
     local last_progress=""
 
-    while [ $waited -lt $max_wait ]; do
-        local full_status=$(get_status)
-        local engine_progress=$(echo "$full_status" | grep -o '"engine_status":{[^}]*}' | grep -o '"progress":[0-9]*' | cut -d: -f2)
-        local engine_state=$(echo "$full_status" | grep -o '"engine_status":{[^}]*}' | grep -o '"status":"[^"]*"' | cut -d'"' -f4)
-        local plugin_data
-        plugin_data=$(status_plugin_data "$full_status")
+    while [ "$waited" -lt "$max_wait" ]; do
+        local full_status engine_progress engine_state plugin_data
+        full_status=$(get_status)
+        engine_progress=$(status_field "$full_status" engine_progress)
+        engine_state=$(status_field "$full_status" engine_status)
+        plugin_data=$(status_field "$full_status" plugin_data)
 
         if [ "$engine_state" = "ready" ] && [ "$plugin_data" = "true" ]; then
             return 0
@@ -76,7 +78,7 @@ wait_for_nessus() {
     local attempt=0
 
     log "Waiting for Nessus service to respond..."
-    while [ $attempt -lt $max_attempts ]; do
+    while [ "$attempt" -lt "$max_attempts" ]; do
         if curl -k -s -f "${NESSUS_API_BASE}/server/status" > /dev/null 2>&1; then
             log "  Nessus is responding"
             return 0
@@ -96,10 +98,13 @@ wait_for_bootstrap_nessus() {
     local max_attempts="${2:-120}"
     local attempt=0
     local base
+    local factory_base="https://127.0.0.1:8834"
+    local backend_base="https://127.0.0.1:${NESSUS_BACKEND_PORT:-8835}"
 
     log "Waiting for Nessus database initialization..."
     while [ "$attempt" -lt "$max_attempts" ]; do
-        for base in "https://127.0.0.1:8834" "$configured_base"; do
+        # Fresh Nessus listens on 8834 until configure-nessus.sh sets the backend port.
+        for base in "$configured_base" "$factory_base" "$backend_base"; do
             [ -n "$base" ] || continue
             if curl -k -s -f "${base}/server/status" >/dev/null 2>&1; then
                 export NESSUS_API_BASE="$base"
@@ -302,6 +307,24 @@ log_local_deb_hint() {
     log "  Offline profile (NESSUS_PROFILE=offline) never uses the Tenable API."
 }
 
+download_nessus_deb() {
+    local url="$1"
+    local destination="$2"
+    local -a download_args=()
+    local output
+
+    if [ -n "${NESSUS_DEB_SHA256:-}" ]; then
+        download_args=(--sha256 "$NESSUS_DEB_SHA256")
+    fi
+    output=$(/usr/local/bin/secure-download.py \
+        "$url" "$destination" "${download_args[@]}" 2>&1) || {
+        log "Error: Secure Nessus package download failed: $output"
+        rm -f "$destination"
+        return 1
+    }
+    log "$output"
+}
+
 install_nessus() {
     if [ -f /opt/nessus/sbin/nessus-service ]; then
         log "Nessus already installed"
@@ -315,10 +338,10 @@ install_nessus() {
         log "Using local Nessus package: $deb_file"
     elif [ -n "${NESSUS_DEB_URL:-}" ]; then
         log "Using NESSUS_DEB_URL from environment"
-        deb_file="/tmp/nessus.deb"
+        deb_file="${NESSUS_DOWNLOAD_DIR}/nessus.deb"
         downloaded_deb=1
-        log "Downloading Nessus from $NESSUS_DEB_URL"
-        wget -q --no-check-certificate -O "$deb_file" "$NESSUS_DEB_URL" || {
+        log "Downloading Nessus from configured URL"
+        download_nessus_deb "$NESSUS_DEB_URL" "$deb_file" || {
             log "Error: Download failed"
             log_local_deb_hint
             return 1
@@ -355,10 +378,10 @@ install_nessus() {
             return 1
         fi
 
-        deb_file="/tmp/nessus.deb"
+        deb_file="${NESSUS_DOWNLOAD_DIR}/nessus.deb"
         downloaded_deb=1
-        log "Downloading Nessus from $download_url"
-        wget -q --no-check-certificate -O "$deb_file" "$download_url" || {
+        log "Downloading Nessus from allowlisted Tenable URL"
+        download_nessus_deb "$download_url" "$deb_file" || {
             log "Error: Download failed"
             log_local_deb_hint
             return 1
@@ -392,13 +415,57 @@ has_update_source() {
 }
 
 cleanup() {
+    local update_pid="" pid="" attempt=0 active=0
+
+    trap - SIGTERM SIGINT SIGQUIT
     echo ""
     log "Shutting down Nessus gracefully..."
-    if [ -n "$MANAGE_API_PID" ] && kill -0 "$MANAGE_API_PID" 2>/dev/null; then
-        kill "$MANAGE_API_PID" 2>/dev/null || true
-    fi
+    [ -f "$LOCK_FILE" ] && update_pid=$(cat "$LOCK_FILE" 2>/dev/null || true)
+
+    for pid in "$MANAGE_API_PID" "$BOOTSTRAP_PID" "$update_pid"; do
+        case "$pid" in
+            ''|*[!0-9]*|"$$") continue ;;
+        esac
+        if kill -0 "$pid" 2>/dev/null; then
+            pkill -TERM -P "$pid" 2>/dev/null || true
+            kill -TERM "$pid" 2>/dev/null || true
+        fi
+    done
+
+    while [ "$attempt" -lt 120 ]; do
+        active=0
+        for pid in "$MANAGE_API_PID" "$BOOTSTRAP_PID" "$update_pid"; do
+            case "$pid" in
+                ''|*[!0-9]*|"$$") continue ;;
+            esac
+            if kill -0 "$pid" 2>/dev/null \
+                && ! ps -o stat= -p "$pid" 2>/dev/null | grep -q '^Z'; then
+                active=1
+            fi
+        done
+        [ "$active" -eq 0 ] && break
+        sleep 1
+        attempt=$((attempt + 1))
+    done
+
+    for pid in "$MANAGE_API_PID" "$BOOTSTRAP_PID" "$update_pid"; do
+        case "$pid" in
+            ''|*[!0-9]*|"$$") continue ;;
+        esac
+        if kill -0 "$pid" 2>/dev/null; then
+            pkill -KILL -P "$pid" 2>/dev/null || true
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    done
+    wait "$MANAGE_API_PID" "$BOOTSTRAP_PID" 2>/dev/null || true
+
     stop_nessus
-    exit 0
+    if /usr/local/bin/patch.sh --feed-unlock; then
+        log "Plugin immutable flags removed for shutdown"
+        exit 0
+    fi
+    log "Error: Could not remove plugin immutable flags during shutdown"
+    exit 1
 }
 trap cleanup SIGTERM SIGINT SIGQUIT
 
@@ -436,30 +503,36 @@ start_operator_api() {
 bootstrap_plugins_async() {
     (
         local UPDATE_FLAG="/opt/nessus/var/nessus/.update_completed"
-        local status plugin_set plugin_data
+        local READY_FILE="${NESSUS_BOOTSTRAP_READY_FILE:-/tmp/nessus_bootstrap_ready}"
+        local status plugin_set plugin_data update_result
 
         if has_update_source; then
             if [ ! -f "$UPDATE_FLAG" ] || /usr/local/bin/update.sh --feed-changed; then
                 log "[bootstrap] Starting plugin update in background..."
-                if /usr/local/bin/update.sh; then
-                    log "[bootstrap] Plugin update completed"
-                else
-                    log "[bootstrap] Warning: Plugin update failed"
-                fi
+                /usr/local/bin/update.sh
+                update_result=$?
+                case "$update_result" in
+                    0)
+                        log "[bootstrap] Plugin update completed"
+                        ;;
+                    2|3)
+                        log "[bootstrap] Plugin update deferred; continuing with installed plugins"
+                        ;;
+                    4)
+                        log "[bootstrap] Plugin update failed; previous plugins restored"
+                        ;;
+                    *)
+                        log "[bootstrap] Error: Plugin update failed; scanner remains unhealthy"
+                        return 1
+                        ;;
+                esac
             elif [ -f "$UPDATE_FLAG" ]; then
-                log "[bootstrap] Applying cached patch..."
-                stop_nessus
-                /usr/local/bin/patch.sh 2>&1 || true
-                start_nessus
+                log "[bootstrap] Feed unchanged; startup patch already applied"
             fi
         elif [ -f "$UPDATE_FLAG" ]; then
-            log "[bootstrap] Applying cached patch..."
-            stop_nessus
-            /usr/local/bin/patch.sh 2>&1 || true
-            start_nessus
+            log "[bootstrap] No update source; startup patch already applied"
         else
-            log "[bootstrap] No plugin source configured; skipping feed bootstrap"
-            return 0
+            log "[bootstrap] No plugin source configured; checking installed plugins"
         fi
 
         log "[bootstrap] Waiting for plugin compilation (timeout ${NESSUS_READY_TIMEOUT:-1800}s)..."
@@ -469,56 +542,47 @@ bootstrap_plugins_async() {
         fi
 
         status=$(get_status)
-        plugin_data=$(status_plugin_data "$status")
+        plugin_data=$(status_field "$status" plugin_data)
         if [ "$plugin_data" != "true" ] && [ -f "$UPDATE_FLAG" ]; then
             log "[bootstrap] Plugins not loaded; retrying patch..."
             stop_nessus
-            /usr/local/bin/patch.sh 2>&1 || true
+            if [ "${NESSUS_PROFILE:-}" = "offline" ]; then
+                /usr/local/bin/patch.sh 2>&1 || true
+            else
+                NESSUS_UPDATE_ONLINE=1 /usr/local/bin/patch.sh 2>&1 || true
+            fi
             start_nessus
             wait_for_ready "${NESSUS_READY_RETRY_TIMEOUT:-600}" || true
         fi
 
         status=$(get_status)
-        plugin_set=$(status_plugin_set "$status")
-        plugin_data=$(status_plugin_data "$status")
+        plugin_set=$(status_field "$status" plugin_set)
+        plugin_data=$(status_field "$status" plugin_data)
         if [ "$plugin_data" = "true" ]; then
+            touch "$READY_FILE"
             log "[bootstrap] Plugins ready${plugin_set:+ ($plugin_set)}"
         else
-            log "[bootstrap] Warning: Plugins still not loaded after bootstrap"
+            rm -f "$READY_FILE"
+            log "[bootstrap] Error: Plugins still not loaded after bootstrap"
+            return 1
         fi
     ) &
-    log "Plugin bootstrap running in background (pid $!)"
+    BOOTSTRAP_PID=$!
+    log "Plugin bootstrap running in background (pid ${BOOTSTRAP_PID})"
 }
 
 print_startup_banner() {
-    local display_url status plugin_set plugin_data engine_state engine_progress
+    local display_url
 
     display_url=$(get_display_url)
-    status=$(get_status)
-    plugin_set=$(status_plugin_set "$status")
-    plugin_data=$(status_plugin_data "$status")
-    engine_state=$(echo "$status" | grep -o '"engine_status":{[^}]*}' | grep -o '"status":"[^"]*"' | cut -d'"' -f4)
-    engine_progress=$(echo "$status" | grep -o '"engine_status":{[^}]*}' | grep -o '"progress":[0-9]*' | cut -d: -f2)
 
     echo ""
     echo "========================================="
-    echo "            NESSUS IS UP"
+    echo "         NESSUS SERVICE STARTED"
     echo "========================================="
     echo "  URL:      $display_url"
     echo "  User:     ${NESSUS_USERNAME:-admin}"
-    if [ "$plugin_data" = "true" ]; then
-        if [ -n "$plugin_set" ]; then
-            echo "  Plugins:  Loaded ($plugin_set)"
-        else
-            echo "  Plugins:  Loaded"
-        fi
-    elif [ "$engine_state" = "ready" ]; then
-        echo "  Plugins:  Not loaded (bootstrap in background)"
-    elif [ -n "$engine_progress" ]; then
-        echo "  Plugins:  Compiling (${engine_progress}%, background)"
-    else
-        echo "  Plugins:  Bootstrap in background (check /manage/v1/health)"
-    fi
+    echo "  Scanner:  Verifying plugins (health remains starting)"
     echo "========================================="
     echo ""
 }
@@ -530,7 +594,8 @@ echo ""
 validate_credentials
 
 mkdir -p /opt/nessus/var/nessus
-mkdir -p /opt/nessus/var/nessus/incoming
+mkdir -p "${NESSUS_MANAGE_UPLOAD_DIR}"
+chmod 700 "${NESSUS_MANAGE_UPLOAD_DIR}"
 
 if ! install_nessus; then
     log "Fatal: Installation failed"
@@ -584,6 +649,7 @@ if ! ensure_admin_user log; then
     wait_for_nessus || exit 1
 fi
 
+rm -f "${NESSUS_BOOTSTRAP_READY_FILE:-/tmp/nessus_bootstrap_ready}"
 start_operator_api
 
 nessus_load_api_credentials

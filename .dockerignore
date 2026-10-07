@@ -2,9 +2,13 @@
 .env
 .env.*
 *.pem
+certs/
+.private-ca/
 *.log
 *.nessus
 *.pdf
+backups/
+*.partial
 __pycache__/
 *.py[cod]
 all-2.0.tar.gz

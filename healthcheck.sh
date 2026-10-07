@@ -1,6 +1,6 @@
 #!/bin/bash
 # Docker healthcheck: Nessus responds + operator API (if enabled).
-# Strict mode (NESSUS_HEALTH_STRICT=1) also requires pluginData=true.
+# Strict mode (default) requires completed bootstrap and pluginData=true.
 # shellcheck shell=bash
 
 # shellcheck source=/dev/null
@@ -12,11 +12,12 @@ check_nessus_alive() {
     status=$(curl -sf -k --connect-timeout 3 --max-time 15 \
         "${NESSUS_API_BASE}/server/status" 2>/dev/null) || return 1
 
-    if [ "${NESSUS_HEALTH_STRICT:-0}" = "1" ]; then
-        engine_state=$(echo "$status" | grep -o '"engine_status":{[^}]*}' \
-            | grep -o '"status":"[^"]*"' | cut -d'"' -f4)
-        plugin_data=$(echo "$status" | sed -n \
-            's/.*"pluginData"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' | head -1)
+    if [ "${NESSUS_HEALTH_STRICT:-1}" = "1" ]; then
+        [ -f "${NESSUS_BOOTSTRAP_READY_FILE:-/tmp/nessus_bootstrap_ready}" ] || return 1
+        engine_state=$(printf '%s' "$status" \
+            | /usr/local/bin/nessus-status.py --field engine_status 2>/dev/null) || return 1
+        plugin_data=$(printf '%s' "$status" \
+            | /usr/local/bin/nessus-status.py --field plugin_data 2>/dev/null) || return 1
         [ "$engine_state" = "ready" ] && [ "$plugin_data" = "true" ]
     fi
 }

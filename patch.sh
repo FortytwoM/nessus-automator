@@ -16,11 +16,17 @@ log() {
 }
 
 feed_unlock() {
+    local path rc=0
+
     if [ -d "$PLUGINS_LIB_DIR" ]; then
-        chattr -i -R "$PLUGINS_LIB_DIR" 2>/dev/null || true
+        chattr -i -R "$PLUGINS_LIB_DIR" 2>/dev/null || rc=1
     fi
-    chattr -i "$PLUGIN_FEED_FILE" "$PLUGIN_FEED_DOT" "$PLUGIN_FEED_LIB" 2>/dev/null || true
+    for path in "$PLUGIN_FEED_FILE" "$PLUGIN_FEED_DOT" "$PLUGIN_FEED_LIB"; do
+        [ -e "$path" ] || continue
+        chattr -i "$path" 2>/dev/null || rc=1
+    done
     rm -f "$FEED_IMMUTABLE_MARKER"
+    return "$rc"
 }
 
 feed_lock() {
@@ -45,8 +51,21 @@ feed_lock() {
 
 if [ "${1:-}" = "--feed-unlock" ]; then
     log "Removing immutable flags from feed files and plugins tree..."
-    feed_unlock
+    if ! feed_unlock; then
+        log "Error: Could not remove all immutable flags"
+        exit 1
+    fi
     log "Feed unlock finished"
+    exit 0
+fi
+
+if [ "${1:-}" = "--feed-lock" ]; then
+    log "Applying immutable flags to feed files and plugins tree..."
+    if ! feed_lock; then
+        log "Error: Could not apply all immutable flags"
+        exit 1
+    fi
+    log "Feed lock finished"
     exit 0
 fi
 
@@ -64,7 +83,8 @@ validate_plugin_set_digits() {
 fetch_online_plugin_set() {
     local result=""
 
-    result=$(curl -s -k --connect-timeout 10 --max-time 30 "$PLUGIN_SET_PHP_URL" 2>/dev/null | tr -d '\n\r ' | head -c 32)
+    result=$(curl -s --fail --show-error --connect-timeout 10 --max-time 30 \
+        "$PLUGIN_SET_PHP_URL" 2>/dev/null | tr -d '\n\r ' | head -c 32)
     if [ -n "$result" ] && validate_plugin_set_digits "$result"; then
         cache_plugin_set "$result"
         log "Using online plugin set from $PLUGIN_SET_PHP_URL: $result" >&2
@@ -160,10 +180,12 @@ if [ "${1:-}" = "--version" ]; then
     exit 0
 fi
 
-feed_unlock
+if ! feed_unlock; then
+    log "Fatal: Could not unlock plugin files before patching"
+    exit 1
+fi
 
-PLUGIN_SET=$(get_plugin_set)
-if [ $? -ne 0 ] || [ -z "$PLUGIN_SET" ]; then
+if ! PLUGIN_SET=$(get_plugin_set) || [ -z "$PLUGIN_SET" ]; then
     log "Fatal: Could not determine plugin set"
     exit 1
 fi

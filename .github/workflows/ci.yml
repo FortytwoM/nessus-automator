@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Unit tests and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install tooling
+        run: python -m pip install --upgrade pip pytest ruff
+
+      - name: Run unit tests
+        run: python -m pytest -q
+
+      - name: Ruff
+        run: ruff check .
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      # Start at error severity so syntax breakage fails fast; tighten to
+      # `-S warning` once the existing scripts report clean.
+      - name: ShellCheck shell scripts
+        run: shellcheck -S error $(git ls-files '*.sh')
