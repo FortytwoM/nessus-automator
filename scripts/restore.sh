@@ -179,9 +179,16 @@ rm -rf "$previous"
 DATA_REPLACED=1
 
 echo "[restore] Reapplying plugin feed protection..."
+restore_patch_rc=0
 compose_run --rm --no-deps \
     --entrypoint /usr/local/bin/patch.sh \
-    nessus
+    nessus || restore_patch_rc=$?
+if [ "$restore_patch_rc" -ne 0 ] && [ "$restore_patch_rc" -ne 3 ]; then
+    exit "$restore_patch_rc"
+fi
+if [ "$restore_patch_rc" -eq 3 ]; then
+    echo "[restore] Warning: feed patched, but plugin immutable lock failed" >&2
+fi
 
 STARTED_AFTER_REPLACE=1
 echo "[restore] Starting Nessus and gateway..."

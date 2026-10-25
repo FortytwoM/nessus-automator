@@ -41,3 +41,6 @@ jobs:
       # `-S warning` once the existing scripts report clean.
       - name: ShellCheck shell scripts
         run: shellcheck -S error $(git ls-files '*.sh')
+
+      - name: Patch script tests
+        run: bash tests/test_patch.sh

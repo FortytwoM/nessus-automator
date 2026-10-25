@@ -32,6 +32,21 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [update] $*"
 }
 
+# patch.sh exits 3 when the feed was written and verified but the plugin tree
+# could not be made immutable. That is a warning for update readiness, not a
+# reason to roll back an otherwise patched feed.
+run_patch() {
+    local rc
+
+    /usr/local/bin/patch.sh
+    rc=$?
+    if [ "$rc" -eq 3 ]; then
+        log "Warning: feed patched, but plugin immutable lock failed"
+        return 0
+    fi
+    return "$rc"
+}
+
 status_field() {
     local status="$1" field="$2"
     printf '%s' "$status" | /usr/local/bin/nessus-status.py --field "$field" 2>/dev/null
@@ -622,10 +637,10 @@ nasl_count=$(find /opt/nessus/lib/nessus/plugins -maxdepth 1 -name "*.nasl" 2>/d
 log "Installed: $nasl_count plugins"
 
 log "Applying patch..."
-if ! /usr/local/bin/patch.sh; then
+if ! run_patch; then
     log "Warning: Initial patch failed, retrying after brief wait..."
     sleep 5
-    if ! /usr/local/bin/patch.sh; then
+    if ! run_patch; then
         rm -f "$ARCHIVE_NAME" "$ARCHIVE_SIG"
         fail_with_rollback "Plugin patch failed"
     fi
@@ -648,7 +663,8 @@ while [ "$waited" -lt "$max_wait" ]; do
 
         if [ "$engine_state" = "ready" ] && [ "$plugin_data" = "true" ]; then
             log "Compilation complete"
-            if [ -f /tmp/nessus_feed_immutable ]; then
+            if [ -f /tmp/nessus_feed_immutable ] \
+                || [ -f /opt/nessus/var/nessus/.feed_immutable ]; then
                 mark_update_complete
                 exit 0
             fi
@@ -656,7 +672,7 @@ while [ "$waited" -lt "$max_wait" ]; do
             pkill -f "nessus-service" > /dev/null 2>&1 || true
             pkill -f "nessusd" > /dev/null 2>&1 || true
             sleep 3
-            if ! /usr/local/bin/patch.sh; then
+            if ! run_patch; then
                 fail_with_rollback "Post-compile patch failed"
             fi
             log "Starting Nessus after final patch..."
