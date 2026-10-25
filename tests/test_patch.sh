@@ -91,7 +91,7 @@ fail() {
 }
 
 run_patch() {
-    "$ROOT_DIR/patch.sh" "$@"
+    bash "$ROOT_DIR/patch.sh" "$@"
 }
 
 is_immutable() {
